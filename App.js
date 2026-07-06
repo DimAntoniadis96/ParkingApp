@@ -4,6 +4,7 @@ import {
   Alert,
   Image,
   Linking,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -173,6 +174,18 @@ function mapConvexSpotToSignal(spot, region, now) {
   };
 }
 
+async function openMapUrl(primaryUrl, fallbackUrl) {
+  try {
+    await Linking.openURL(primaryUrl);
+  } catch (error) {
+    try {
+      await Linking.openURL(fallbackUrl);
+    } catch (fallbackError) {
+      Alert.alert('Could not open maps', 'Please check that a maps app or browser is available.');
+    }
+  }
+}
+
 export default function App() {
   return (
     <ConvexProvider client={convex}>
@@ -192,6 +205,7 @@ function ParkingApp() {
   const [location, setLocation] = useState(null);
   const [region, setRegion] = useState(null);
   const [selectedTime, setSelectedTime] = useState(5);
+  const [selectedSignalId, setSelectedSignalId] = useState(null);
   const [now, setNow] = useState(Date.now());
   const [sharedSpot, setSharedSpot] = useState(null);
   const [isLocating, setIsLocating] = useState(false);
@@ -220,6 +234,11 @@ function ParkingApp() {
     return activeSpots.map((spot) => mapConvexSpotToSignal(spot, region, now));
   }, [activeSpots, now, region]);
   const bestSignal = parkingSignals[0];
+  const selectedSignal = useMemo(
+    () => parkingSignals.find((signal) => signal.id === selectedSignalId),
+    [parkingSignals, selectedSignalId],
+  );
+  const focusedSignal = selectedSignal || bestSignal;
   const sharedSpotDisplay = getSharedSpotDisplay(sharedSpot, now);
   const panelIsCompact = height < 740;
 
@@ -244,6 +263,12 @@ function ParkingApp() {
       setSharedSpot(null);
     }
   }, [now, sharedSpot]);
+
+  useEffect(() => {
+    if (selectedSignalId && !selectedSignal) {
+      setSelectedSignalId(null);
+    }
+  }, [selectedSignal, selectedSignalId]);
 
   if (showIntro) {
     return (
@@ -293,13 +318,43 @@ function ParkingApp() {
     }
   };
 
-  const handleFindParking = () => {
-    if (bestSignal) {
-      Alert.alert('Best spot nearby', `${bestSignal.title} • ${bestSignal.subtitle}`);
+  const handleDriveToSpot = (signal) => {
+    if (!signal) {
+      Alert.alert('No spot selected', 'Tap a parking spot on the map first.');
       return;
     }
 
-    Alert.alert('No fresh spots yet', 'Keep the map open. New spots will appear here.');
+    const { latitude, longitude } = signal.coordinate;
+    const destination = `${latitude},${longitude}`;
+    const googleMapsWebUrl = `https://www.google.com/maps/dir/?api=1&destination=${destination}&travelmode=driving`;
+
+    if (Platform.OS === 'ios') {
+      const appleMapsUrl = `http://maps.apple.com/?daddr=${destination}&dirflg=d`;
+      const googleMapsUrl = `comgooglemaps://?daddr=${destination}&directionsmode=driving`;
+
+      Alert.alert('Drive to this spot', 'Choose your maps app.', [
+        {
+          text: 'Apple Maps',
+          onPress: () => openMapUrl(appleMapsUrl, googleMapsWebUrl),
+        },
+        {
+          text: 'Google Maps',
+          onPress: () => openMapUrl(googleMapsUrl, googleMapsWebUrl),
+        },
+        {
+          text: 'Cancel',
+          style: 'cancel',
+        },
+      ]);
+      return;
+    }
+
+    if (Platform.OS === 'android') {
+      openMapUrl(`google.navigation:q=${destination}&mode=d`, googleMapsWebUrl);
+      return;
+    }
+
+    openMapUrl(googleMapsWebUrl, googleMapsWebUrl);
   };
 
   const handleDropPin = async (minutes = selectedTime) => {
@@ -430,8 +485,15 @@ function ParkingApp() {
                 coordinate={signal.coordinate}
                 title={signal.title}
                 description={signal.subtitle}
+                onPress={() => setSelectedSignalId(signal.id)}
               >
-                <View style={[styles.signalMarker, { backgroundColor: signalStyle.color }]}>
+                <View
+                  style={[
+                    styles.signalMarker,
+                    { backgroundColor: signalStyle.color },
+                    focusedSignal?.id === signal.id && styles.signalMarkerSelected,
+                  ]}
+                >
                   <Ionicons name={signalStyle.icon} size={20} color={colors.white} />
                 </View>
               </Marker>
@@ -485,13 +547,19 @@ function ParkingApp() {
 
           {intent === 'find' ? (
             <View style={styles.panelBody}>
-              <Text style={styles.panelTitle}>{bestSignal ? bestSignal.title : 'No fresh spots yet'}</Text>
+              <Text style={styles.panelTitle}>{focusedSignal ? focusedSignal.title : 'No fresh spots yet'}</Text>
               <Text style={styles.panelCopy}>
-                {bestSignal ? `${bestSignal.subtitle} away` : 'Leave the map open. New spots appear automatically.'}
+                {focusedSignal
+                  ? `${focusedSignal.subtitle} away. Tap another spot to change.`
+                  : 'Leave the map open. New spots appear automatically.'}
               </Text>
-              <Pressable style={styles.primaryButton} onPress={handleFindParking}>
-                <Ionicons name="sparkles" size={20} color={colors.black} />
-                <Text style={styles.primaryButtonText}>{bestSignal ? 'Show me' : 'Keep looking'}</Text>
+              <Pressable
+                style={[styles.primaryButton, !focusedSignal && styles.buttonDisabled]}
+                onPress={() => handleDriveToSpot(focusedSignal)}
+                disabled={!focusedSignal}
+              >
+                <Ionicons name="navigate" size={20} color={colors.black} />
+                <Text style={styles.primaryButtonText}>Drive there</Text>
               </Pressable>
             </View>
           ) : (
