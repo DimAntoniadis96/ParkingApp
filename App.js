@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -13,23 +13,26 @@ import {
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
 import { Ionicons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { ConvexProvider, ConvexReactClient, useMutation, useQuery } from 'convex/react';
 import MapView, { Marker, PROVIDER_DEFAULT } from 'react-native-maps';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { api } from './convex/_generated/api';
 
 const signalTypes = {
-  strong: {
+  green: {
     label: 'Strong lead',
     color: '#16a34a',
     softColor: '#dcfce7',
     icon: 'checkmark-circle',
   },
-  watch: {
+  orange: {
     label: 'Watch closely',
     color: '#f59e0b',
     softColor: '#fef3c7',
     icon: 'time',
   },
-  stale: {
+  red: {
     label: 'Likely gone',
     color: '#ef4444',
     softColor: '#fee2e2',
@@ -38,12 +41,51 @@ const signalTypes = {
 };
 
 const menuSignals = [
-  { label: 'Fresh exits', value: '3', tone: 'strong' },
-  { label: 'Open leads', value: '12', tone: 'watch' },
-  { label: 'Avg. confidence', value: '82%', tone: 'strong' },
+  { label: 'Fresh exits', value: '3', tone: 'green' },
+  { label: 'Open leads', value: '12', tone: 'orange' },
+  { label: 'Avg. confidence', value: '82%', tone: 'green' },
 ];
 
 const departureTimes = [2, 5, 8];
+const CLIENT_ID_STORAGE_KEY = 'parkpilot.clientId';
+const ACTIVE_QUERY_LIMIT = 90;
+const EXPIRE_AFTER_DEPARTURE_MS = 12 * 60 * 1000;
+const ORANGE_AFTER_DEPARTURE_MS = 5 * 60 * 1000;
+const DEFAULT_CAR_INFO = {
+  brand: 'Private vehicle',
+  color: 'Hidden',
+  plate_slug: 'private',
+};
+
+const convexUrl = process.env.EXPO_PUBLIC_CONVEX_URL;
+
+if (!convexUrl) {
+  throw new Error('Missing EXPO_PUBLIC_CONVEX_URL. Make sure Convex generated .env.local is loaded by Expo.');
+}
+
+const convex = new ConvexReactClient(convexUrl, {
+  unsavedChangesWarning: false,
+});
+
+function createAnonymousClientId() {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function getClientId() {
+  const existingClientId = await AsyncStorage.getItem(CLIENT_ID_STORAGE_KEY);
+
+  if (existingClientId) {
+    return existingClientId;
+  }
+
+  const nextClientId = createAnonymousClientId();
+  await AsyncStorage.setItem(CLIENT_ID_STORAGE_KEY, nextClientId);
+
+  return nextClientId;
+}
 
 function createRegion(coords) {
   return {
@@ -62,7 +104,7 @@ function createParkingSignals(region) {
   return [
     {
       id: 'fresh-exit',
-      type: 'strong',
+      type: 'green',
       title: 'Driver leaving in 5 min',
       subtitle: 'Blue Toyota, plate ending 123',
       confidence: '92%',
@@ -74,7 +116,7 @@ function createParkingSignals(region) {
     },
     {
       id: 'soft-lead',
-      type: 'watch',
+      type: 'orange',
       title: 'Meter just expired',
       subtitle: 'Good turnover street, verify on arrival',
       confidence: '68%',
@@ -86,7 +128,7 @@ function createParkingSignals(region) {
     },
     {
       id: 'old-lead',
-      type: 'stale',
+      type: 'red',
       title: 'Vacated 6 min ago',
       subtitle: 'High risk, likely taken',
       confidence: '31%',
@@ -99,11 +141,99 @@ function createParkingSignals(region) {
   ];
 }
 
+function getStatusForTime(now, scheduledDepartureTime) {
+  if (now < scheduledDepartureTime) {
+    return 'green';
+  }
+
+  if (now < scheduledDepartureTime + ORANGE_AFTER_DEPARTURE_MS) {
+    return 'orange';
+  }
+
+  return 'red';
+}
+
+function formatMinuteDelta(milliseconds) {
+  const minutes = Math.max(0, Math.ceil(milliseconds / 60000));
+
+  if (minutes === 1) {
+    return '1 min';
+  }
+
+  return `${minutes} min`;
+}
+
+function formatDepartureLabel(timestamp, now = Date.now()) {
+  const minutesUntilDeparture = Math.max(0, Math.round((timestamp - now) / 60000));
+
+  if (minutesUntilDeparture === 0) {
+    return 'Leaving now';
+  }
+
+  return `Leaves in ${minutesUntilDeparture} min`;
+}
+
+function getSharedSpotDisplay(sharedSpot, now) {
+  if (!sharedSpot || now >= sharedSpot.expiresAt) {
+    return null;
+  }
+
+  const status = getStatusForTime(now, sharedSpot.scheduledDepartureTime);
+  const opensIn = sharedSpot.scheduledDepartureTime - now;
+  const expiresIn = sharedSpot.expiresAt - now;
+
+  if (opensIn > 0) {
+    return {
+      status,
+      title: `Opening in ${formatMinuteDelta(opensIn)}`,
+      copy: `Your signal is live. It will stay visible until ${formatMinuteDelta(expiresIn)} from now.`,
+    };
+  }
+
+  return {
+    status,
+    title: 'Spot should be open now',
+    copy: `ParkPilot will auto-remove this signal in ${formatMinuteDelta(expiresIn)}.`,
+  };
+}
+
+function formatDistanceFromRegion(spot, region) {
+  if (!region) {
+    return 'Nearby';
+  }
+
+  const latitudeMeters = (spot.latitude - region.latitude) * 111000;
+  const longitudeMeters =
+    (spot.longitude - region.longitude) * 111000 * Math.cos((region.latitude * Math.PI) / 180);
+  const distance = Math.round(Math.sqrt(latitudeMeters ** 2 + longitudeMeters ** 2));
+
+  return distance < 1000 ? `${distance} m` : `${(distance / 1000).toFixed(1)} km`;
+}
+
+function mapConvexSpotToSignal(spot, region, now) {
+  const status = getStatusForTime(now, spot.scheduled_departure_time);
+
+  return {
+    id: spot._id,
+    type: status,
+    title: formatDepartureLabel(spot.scheduled_departure_time, now),
+    subtitle: `${spot.car_info.color} ${spot.car_info.brand}, plate ${spot.car_info.plate_slug}`,
+    confidence: status.toUpperCase(),
+    distance: formatDistanceFromRegion(spot, region),
+    coordinate: {
+      latitude: spot.latitude,
+      longitude: spot.longitude,
+    },
+  };
+}
+
 export default function App() {
   return (
-    <SafeAreaProvider>
-      <ParkingApp />
-    </SafeAreaProvider>
+    <ConvexProvider client={convex}>
+      <SafeAreaProvider>
+        <ParkingApp />
+      </SafeAreaProvider>
+    </ConvexProvider>
   );
 }
 
@@ -114,14 +244,55 @@ function ParkingApp() {
   const [intent, setIntent] = useState('find');
   const [location, setLocation] = useState(null);
   const [region, setRegion] = useState(null);
+  const activeSpots = useQuery(
+    api.parking.getNearbyActiveSpots,
+    region
+      ? {
+          latitude: region.latitude,
+          longitude: region.longitude,
+          limit: ACTIVE_QUERY_LIMIT,
+        }
+      : 'skip',
+  );
+  const shareSpot = useMutation(api.parking.shareSpot);
+  const cancelMyActiveSpot = useMutation(api.parking.cancelMyActiveSpot);
   const [errorMsg, setErrorMsg] = useState('');
   const [selectedTime, setSelectedTime] = useState(5);
+  const [now, setNow] = useState(Date.now());
+  const [sharedSpot, setSharedSpot] = useState(null);
   const [isRefreshingLocation, setIsRefreshingLocation] = useState(false);
+  const [isSharingSpot, setIsSharingSpot] = useState(false);
+  const [isCancellingSpot, setIsCancellingSpot] = useState(false);
 
   const isCompact = height < 720;
-  const parkingSignals = useMemo(() => createParkingSignals(region), [region]);
+  const parkingSignals = useMemo(() => {
+    if (activeSpots === undefined) {
+      return createParkingSignals(region);
+    }
+
+    if (activeSpots?.length) {
+      return activeSpots.map((spot) => mapConvexSpotToSignal(spot, region, now));
+    }
+
+    return [];
+  }, [activeSpots, now, region]);
   const highlightedSignal = parkingSignals[0];
   const locationAccuracy = location?.accuracy ? `${Math.round(location.accuracy)} m GPS` : 'Fresh source';
+  const sharedSpotDisplay = getSharedSpotDisplay(sharedSpot, now);
+
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      setNow(Date.now());
+    }, 15000);
+
+    return () => clearInterval(intervalId);
+  }, []);
+
+  useEffect(() => {
+    if (sharedSpot && now >= sharedSpot.expiresAt) {
+      setSharedSpot(null);
+    }
+  }, [now, sharedSpot]);
 
   const prepareMap = async (nextIntent = intent) => {
     setIntent(nextIntent);
@@ -170,11 +341,74 @@ function ParkingApp() {
     );
   };
 
-  const handleDropPin = (minutes = selectedTime) => {
-    Alert.alert(
-      'Departure signal shared',
-      `Your spot is marked as opening in ${minutes} minutes. Supabase sync can be connected next.`,
-    );
+  const handleDropPin = async (minutes = selectedTime) => {
+    if (isSharingSpot) {
+      return;
+    }
+
+    setIsSharingSpot(true);
+
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+
+      if (status !== 'granted') {
+        Alert.alert('Location needed', 'Turn on location access so ParkPilot can save your exact spot.');
+        return;
+      }
+
+      const currentLocation = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+      const coords = currentLocation.coords;
+      const scheduledDepartureTime = Date.now() + minutes * 60 * 1000;
+      const expiresAt = scheduledDepartureTime + EXPIRE_AFTER_DEPARTURE_MS;
+      const clientId = await getClientId();
+
+      setLocation(coords);
+      setRegion(createRegion(coords));
+
+      const spotId = await shareSpot({
+        latitude: coords.latitude,
+        longitude: coords.longitude,
+        scheduled_departure_time: scheduledDepartureTime,
+        client_id: clientId,
+        car_info: DEFAULT_CAR_INFO,
+      });
+
+      setSharedSpot({
+        id: spotId,
+        minutes,
+        scheduledDepartureTime,
+        expiresAt,
+      });
+
+      Alert.alert('Spot saved', `Your live signal is active and opens in ${minutes} minutes.`);
+    } catch (error) {
+      console.error(error);
+      Alert.alert('Could not save spot', 'Check your connection and try again.');
+    } finally {
+      setIsSharingSpot(false);
+    }
+  };
+
+  const handleCancelSharedSpot = async () => {
+    if (isCancellingSpot) {
+      return;
+    }
+
+    setIsCancellingSpot(true);
+
+    try {
+      const clientId = await getClientId();
+      await cancelMyActiveSpot({ client_id: clientId });
+      setSharedSpot(null);
+      Alert.alert('Signal cancelled', 'Your active parking signal was removed.');
+    } catch (error) {
+      console.error(error);
+      Alert.alert('Could not cancel signal', 'Check your connection and try again.');
+    } finally {
+      setIsCancellingSpot(false);
+    }
   };
 
   if (screen === 'locating') {
@@ -344,13 +578,59 @@ function ParkingApp() {
               <View style={styles.panelHeader}>
                 <View>
                   <Text style={styles.panelLabel}>Share your spot</Text>
-                  <Text style={styles.panelTitle}>When are you leaving?</Text>
+                  <Text style={styles.panelTitle}>
+                    {sharedSpotDisplay ? 'Your signal is live' : 'When are you leaving?'}
+                  </Text>
                 </View>
                 <View style={styles.privacyBadge}>
                   <Ionicons name="lock-closed" size={14} color="#0f172a" />
                   <Text style={styles.privacyText}>Plate hidden</Text>
                 </View>
               </View>
+              {sharedSpotDisplay && (
+                <View
+                  style={[
+                    styles.liveSignalCard,
+                    {
+                      backgroundColor: signalTypes[sharedSpotDisplay.status].softColor,
+                      borderColor: signalTypes[sharedSpotDisplay.status].color,
+                    },
+                  ]}
+                >
+                  <View style={styles.liveSignalHeader}>
+                    <View
+                      style={[
+                        styles.liveSignalIcon,
+                        { backgroundColor: signalTypes[sharedSpotDisplay.status].color },
+                      ]}
+                    >
+                      <Ionicons
+                        name={signalTypes[sharedSpotDisplay.status].icon}
+                        size={18}
+                        color="#ffffff"
+                      />
+                    </View>
+                    <View style={styles.liveSignalTextWrap}>
+                      <Text style={styles.liveSignalTitle}>{sharedSpotDisplay.title}</Text>
+                      <Text style={styles.liveSignalCopy}>{sharedSpotDisplay.copy}</Text>
+                    </View>
+                  </View>
+                  <Pressable
+                    style={[styles.cancelSignalButton, isCancellingSpot && styles.primaryButtonDisabled]}
+                    onPress={handleCancelSharedSpot}
+                    disabled={isCancellingSpot}
+                  >
+                    {isCancellingSpot ? (
+                      <ActivityIndicator size="small" color="#0f172a" />
+                    ) : (
+                      <Ionicons name="close-circle" size={17} color="#0f172a" />
+                    )}
+                    <Text style={styles.cancelSignalText}>
+                      {isCancellingSpot ? 'Cancelling...' : 'Cancel signal'}
+                    </Text>
+                  </Pressable>
+                </View>
+              )}
               <View style={styles.timeRow}>
                 {departureTimes.map((minutes) => (
                   <Pressable
@@ -364,9 +644,23 @@ function ParkingApp() {
                   </Pressable>
                 ))}
               </View>
-              <Pressable style={styles.primaryButton} onPress={() => handleDropPin(selectedTime)}>
-                <Ionicons name="radio" size={20} color="#ffffff" />
-                <Text style={styles.primaryButtonText}>Drop Departure Signal</Text>
+              <Pressable
+                style={[styles.primaryButton, isSharingSpot && styles.primaryButtonDisabled]}
+                onPress={() => handleDropPin(selectedTime)}
+                disabled={isSharingSpot}
+              >
+                {isSharingSpot ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Ionicons name="radio" size={20} color="#ffffff" />
+                )}
+                <Text style={styles.primaryButtonText}>
+                  {isSharingSpot
+                    ? 'Saving Signal...'
+                    : sharedSpotDisplay
+                      ? 'Update Departure Signal'
+                      : 'Drop Departure Signal'}
+                </Text>
               </Pressable>
             </View>
           )}
@@ -468,9 +762,9 @@ function ParkingApp() {
           <Ionicons name="analytics" size={20} color="#22c55e" />
           <Text style={styles.intelligenceTitle}>Signal intelligence</Text>
         </View>
-        <SignalRow tone="strong" label="Green" copy="Confirmed departures and high-confidence openings." />
-        <SignalRow tone="watch" label="Amber" copy="Useful hints that need a quick visual check." />
-        <SignalRow tone="stale" label="Red" copy="Older reports kept visible so you do not waste time." />
+        <SignalRow tone="green" label="Green" copy="Confirmed departures and high-confidence openings." />
+        <SignalRow tone="orange" label="Amber" copy="Useful hints that need a quick visual check." />
+        <SignalRow tone="red" label="Red" copy="Older reports kept visible so you do not waste time." />
       </View>
     </ScrollView>
   );
@@ -1038,6 +1332,9 @@ const styles = StyleSheet.create({
     borderRadius: 18,
     backgroundColor: '#16a34a',
   },
+  primaryButtonDisabled: {
+    opacity: 0.7,
+  },
   primaryButtonText: {
     color: '#ffffff',
     fontSize: 16,
@@ -1078,6 +1375,53 @@ const styles = StyleSheet.create({
   privacyText: {
     color: '#0f172a',
     fontSize: 12,
+    fontWeight: '900',
+  },
+  liveSignalCard: {
+    gap: 12,
+    padding: 13,
+    borderRadius: 18,
+    borderWidth: 1,
+  },
+  liveSignalHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+  },
+  liveSignalIcon: {
+    width: 36,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 13,
+  },
+  liveSignalTextWrap: {
+    flex: 1,
+    gap: 2,
+  },
+  liveSignalTitle: {
+    color: '#0f172a',
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  liveSignalCopy: {
+    color: '#334155',
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '700',
+  },
+  cancelSignalButton: {
+    minHeight: 40,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+    borderRadius: 14,
+    backgroundColor: 'rgba(255, 255, 255, 0.65)',
+  },
+  cancelSignalText: {
+    color: '#0f172a',
+    fontSize: 13,
     fontWeight: '900',
   },
   timeRow: {
