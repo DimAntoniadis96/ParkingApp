@@ -1,33 +1,44 @@
 {
   "expo": {
-    "name": "myAPP",
-    "slug": "myAPP",
+    "name": "Park2Me",
+    "slug": "park2me",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/park2me-app-icon-clean.png",
     "userInterfaceStyle": "automatic",
     "plugins": [
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Allow ParkPilot to show live parking signals around you."
+          "locationWhenInUsePermission": "Allow Park2Me to show live parking signals around you."
         }
       ],
-      "expo-font"
+      "expo-font",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#050706",
+          "image": "./assets/park2me-splash-logo-clean.png",
+          "imageWidth": 260,
+          "resizeMode": "contain",
+          "dark": {
+            "backgroundColor": "#050706",
+            "image": "./assets/park2me-splash-logo-clean.png"
+          }
+        }
+      ]
     ],
     "ios": {
       "supportsTablet": true
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
+        "backgroundColor": "#050706",
+        "foregroundImage": "./assets/park2me-adaptive-foreground-clean.png"
       }
     },
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/park2me-favicon-clean.png"
     }
   }
 }

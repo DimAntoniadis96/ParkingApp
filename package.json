@@ -1,5 +1,5 @@
 {
-  "name": "myapp",
+  "name": "park2me",
   "version": "1.0.0",
   "main": "index.js",
   "dependencies": {
@@ -12,6 +12,7 @@
     "expo": "~57.0.2",
     "expo-font": "~57.0.0",
     "expo-location": "~57.0.2",
+    "expo-splash-screen": "~57.0.2",
     "expo-status-bar": "~57.0.0",
     "react": "19.2.3",
     "react-native": "0.86.0",

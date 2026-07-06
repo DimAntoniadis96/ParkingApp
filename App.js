@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Image,
   Linking,
   Pressable,
   ScrollView,
@@ -19,35 +20,41 @@ import MapView, { Marker, PROVIDER_DEFAULT } from 'react-native-maps';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { api } from './convex/_generated/api';
 
+const park2MeLogo = require('./park2me_logo.png');
+const park2MeSmallLogo = require('./assets/park2me-small-logo-horizontal.png');
+
+const colors = {
+  black: '#050706',
+  panel: '#0d120f',
+  panelSoft: '#151c18',
+  panelRaised: '#1b241f',
+  green: '#22c55e',
+  greenSoft: '#173d25',
+  orange: '#f59e0b',
+  red: '#ef4444',
+  white: '#f8fafc',
+  muted: '#95a39b',
+  dim: '#56635d',
+  border: '#243029',
+};
+
 const signalTypes = {
   green: {
-    label: 'Strong lead',
-    color: '#16a34a',
-    softColor: '#dcfce7',
-    icon: 'checkmark-circle',
+    color: colors.green,
+    icon: 'checkmark',
   },
   orange: {
-    label: 'Watch closely',
-    color: '#f59e0b',
-    softColor: '#fef3c7',
+    color: colors.orange,
     icon: 'time',
   },
   red: {
-    label: 'Likely gone',
-    color: '#ef4444',
-    softColor: '#fee2e2',
-    icon: 'alert-circle',
+    color: colors.red,
+    icon: 'close',
   },
 };
 
-const menuSignals = [
-  { label: 'Fresh exits', value: '3', tone: 'green' },
-  { label: 'Open leads', value: '12', tone: 'orange' },
-  { label: 'Avg. confidence', value: '82%', tone: 'green' },
-];
-
 const departureTimes = [2, 5, 8];
-const CLIENT_ID_STORAGE_KEY = 'parkpilot.clientId';
+const CLIENT_ID_STORAGE_KEY = 'park2me.clientId';
 const ACTIVE_QUERY_LIMIT = 90;
 const EXPIRE_AFTER_DEPARTURE_MS = 12 * 60 * 1000;
 const ORANGE_AFTER_DEPARTURE_MS = 5 * 60 * 1000;
@@ -96,51 +103,6 @@ function createRegion(coords) {
   };
 }
 
-function createParkingSignals(region) {
-  if (!region) {
-    return [];
-  }
-
-  return [
-    {
-      id: 'fresh-exit',
-      type: 'green',
-      title: 'Driver leaving in 5 min',
-      subtitle: 'Blue Toyota, plate ending 123',
-      confidence: '92%',
-      distance: '90 m',
-      coordinate: {
-        latitude: region.latitude + 0.0011,
-        longitude: region.longitude + 0.001,
-      },
-    },
-    {
-      id: 'soft-lead',
-      type: 'orange',
-      title: 'Meter just expired',
-      subtitle: 'Good turnover street, verify on arrival',
-      confidence: '68%',
-      distance: '180 m',
-      coordinate: {
-        latitude: region.latitude - 0.0014,
-        longitude: region.longitude + 0.0018,
-      },
-    },
-    {
-      id: 'old-lead',
-      type: 'red',
-      title: 'Vacated 6 min ago',
-      subtitle: 'High risk, likely taken',
-      confidence: '31%',
-      distance: '260 m',
-      coordinate: {
-        latitude: region.latitude - 0.002,
-        longitude: region.longitude - 0.0012,
-      },
-    },
-  ];
-}
-
 function getStatusForTime(now, scheduledDepartureTime) {
   if (now < scheduledDepartureTime) {
     return 'green';
@@ -153,53 +115,15 @@ function getStatusForTime(now, scheduledDepartureTime) {
   return 'red';
 }
 
-function formatMinuteDelta(milliseconds) {
+function formatMinutes(milliseconds) {
   const minutes = Math.max(0, Math.ceil(milliseconds / 60000));
 
-  if (minutes === 1) {
-    return '1 min';
-  }
-
-  return `${minutes} min`;
-}
-
-function formatDepartureLabel(timestamp, now = Date.now()) {
-  const minutesUntilDeparture = Math.max(0, Math.round((timestamp - now) / 60000));
-
-  if (minutesUntilDeparture === 0) {
-    return 'Leaving now';
-  }
-
-  return `Leaves in ${minutesUntilDeparture} min`;
-}
-
-function getSharedSpotDisplay(sharedSpot, now) {
-  if (!sharedSpot || now >= sharedSpot.expiresAt) {
-    return null;
-  }
-
-  const status = getStatusForTime(now, sharedSpot.scheduledDepartureTime);
-  const opensIn = sharedSpot.scheduledDepartureTime - now;
-  const expiresIn = sharedSpot.expiresAt - now;
-
-  if (opensIn > 0) {
-    return {
-      status,
-      title: `Opening in ${formatMinuteDelta(opensIn)}`,
-      copy: `Your signal is live. It will stay visible until ${formatMinuteDelta(expiresIn)} from now.`,
-    };
-  }
-
-  return {
-    status,
-    title: 'Spot should be open now',
-    copy: `ParkPilot will auto-remove this signal in ${formatMinuteDelta(expiresIn)}.`,
-  };
+  return minutes === 1 ? '1 min' : `${minutes} min`;
 }
 
 function formatDistanceFromRegion(spot, region) {
   if (!region) {
-    return 'Nearby';
+    return 'nearby';
   }
 
   const latitudeMeters = (spot.latitude - region.latitude) * 111000;
@@ -210,16 +134,38 @@ function formatDistanceFromRegion(spot, region) {
   return distance < 1000 ? `${distance} m` : `${(distance / 1000).toFixed(1)} km`;
 }
 
+function formatSpotTime(scheduledDepartureTime, now) {
+  const milliseconds = scheduledDepartureTime - now;
+
+  if (milliseconds > 0) {
+    return `Opens in ${formatMinutes(milliseconds)}`;
+  }
+
+  return 'Open now';
+}
+
+function getSharedSpotDisplay(sharedSpot, now) {
+  if (!sharedSpot || now >= sharedSpot.expiresAt) {
+    return null;
+  }
+
+  const status = getStatusForTime(now, sharedSpot.scheduledDepartureTime);
+
+  return {
+    status,
+    title: formatSpotTime(sharedSpot.scheduledDepartureTime, now),
+    copy: status === 'green' ? 'Your spot is shared.' : 'Thanks. Drivers can see it now.',
+  };
+}
+
 function mapConvexSpotToSignal(spot, region, now) {
   const status = getStatusForTime(now, spot.scheduled_departure_time);
 
   return {
     id: spot._id,
     type: status,
-    title: formatDepartureLabel(spot.scheduled_departure_time, now),
-    subtitle: `${spot.car_info.color} ${spot.car_info.brand}, plate ${spot.car_info.plate_slug}`,
-    confidence: status.toUpperCase(),
-    distance: formatDistanceFromRegion(spot, region),
+    title: formatSpotTime(spot.scheduled_departure_time, now),
+    subtitle: formatDistanceFromRegion(spot, region),
     coordinate: {
       latitude: spot.latitude,
       longitude: spot.longitude,
@@ -241,9 +187,18 @@ function ParkingApp() {
   const insets = useSafeAreaInsets();
   const { width, height } = useWindowDimensions();
   const [screen, setScreen] = useState('menu');
+  const [showIntro, setShowIntro] = useState(true);
   const [intent, setIntent] = useState('find');
   const [location, setLocation] = useState(null);
   const [region, setRegion] = useState(null);
+  const [selectedTime, setSelectedTime] = useState(5);
+  const [now, setNow] = useState(Date.now());
+  const [sharedSpot, setSharedSpot] = useState(null);
+  const [isLocating, setIsLocating] = useState(false);
+  const [isSharingSpot, setIsSharingSpot] = useState(false);
+  const [isCancellingSpot, setIsCancellingSpot] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
+
   const activeSpots = useQuery(
     api.parking.getNearbyActiveSpots,
     region
@@ -256,29 +211,25 @@ function ParkingApp() {
   );
   const shareSpot = useMutation(api.parking.shareSpot);
   const cancelMyActiveSpot = useMutation(api.parking.cancelMyActiveSpot);
-  const [errorMsg, setErrorMsg] = useState('');
-  const [selectedTime, setSelectedTime] = useState(5);
-  const [now, setNow] = useState(Date.now());
-  const [sharedSpot, setSharedSpot] = useState(null);
-  const [isRefreshingLocation, setIsRefreshingLocation] = useState(false);
-  const [isSharingSpot, setIsSharingSpot] = useState(false);
-  const [isCancellingSpot, setIsCancellingSpot] = useState(false);
 
-  const isCompact = height < 720;
   const parkingSignals = useMemo(() => {
-    if (activeSpots === undefined) {
-      return createParkingSignals(region);
+    if (!activeSpots?.length) {
+      return [];
     }
 
-    if (activeSpots?.length) {
-      return activeSpots.map((spot) => mapConvexSpotToSignal(spot, region, now));
-    }
-
-    return [];
+    return activeSpots.map((spot) => mapConvexSpotToSignal(spot, region, now));
   }, [activeSpots, now, region]);
-  const highlightedSignal = parkingSignals[0];
-  const locationAccuracy = location?.accuracy ? `${Math.round(location.accuracy)} m GPS` : 'Fresh source';
+  const bestSignal = parkingSignals[0];
   const sharedSpotDisplay = getSharedSpotDisplay(sharedSpot, now);
+  const panelIsCompact = height < 740;
+
+  useEffect(() => {
+    const introTimer = setTimeout(() => {
+      setShowIntro(false);
+    }, 1400);
+
+    return () => clearTimeout(introTimer);
+  }, []);
 
   useEffect(() => {
     const intervalId = setInterval(() => {
@@ -294,21 +245,29 @@ function ParkingApp() {
     }
   }, [now, sharedSpot]);
 
+  if (showIntro) {
+    return (
+      <View style={styles.introScreen}>
+        <StatusBar style="light" />
+        <Image source={park2MeLogo} style={styles.introLogo} resizeMode="contain" />
+      </View>
+    );
+  }
+
   const prepareMap = async (nextIntent = intent) => {
     setIntent(nextIntent);
     setErrorMsg('');
+    setIsLocating(true);
 
     if (!region) {
       setScreen('locating');
-    } else {
-      setIsRefreshingLocation(true);
     }
 
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
 
       if (status !== 'granted') {
-        setErrorMsg('Location access is required to show nearby parking signals.');
+        setErrorMsg('Turn on location to see parking near you.');
         setScreen(region ? 'map' : 'error');
         return;
       }
@@ -327,18 +286,20 @@ function ParkingApp() {
       setRegion(createRegion(currentLocation.coords));
       setScreen('map');
     } catch (error) {
-      setErrorMsg('We could not read your current location. Check GPS and try again.');
+      setErrorMsg('We could not find you. Please try again.');
       setScreen(region ? 'map' : 'error');
     } finally {
-      setIsRefreshingLocation(false);
+      setIsLocating(false);
     }
   };
 
   const handleFindParking = () => {
-    Alert.alert(
-      'Scanning nearby blocks',
-      'ParkPilot is prioritizing fresh exits, meter activity, and stale signals around your current position.',
-    );
+    if (bestSignal) {
+      Alert.alert('Best spot nearby', `${bestSignal.title} • ${bestSignal.subtitle}`);
+      return;
+    }
+
+    Alert.alert('No fresh spots yet', 'Keep the map open. New spots will appear here.');
   };
 
   const handleDropPin = async (minutes = selectedTime) => {
@@ -352,7 +313,7 @@ function ParkingApp() {
       const { status } = await Location.requestForegroundPermissionsAsync();
 
       if (status !== 'granted') {
-        Alert.alert('Location needed', 'Turn on location access so ParkPilot can save your exact spot.');
+        Alert.alert('Location needed', 'Turn on location so we can share your spot.');
         return;
       }
 
@@ -377,15 +338,12 @@ function ParkingApp() {
 
       setSharedSpot({
         id: spotId,
-        minutes,
         scheduledDepartureTime,
         expiresAt,
       });
-
-      Alert.alert('Spot saved', `Your live signal is active and opens in ${minutes} minutes.`);
     } catch (error) {
       console.error(error);
-      Alert.alert('Could not save spot', 'Check your connection and try again.');
+      Alert.alert('Could not share spot', 'Check your connection and try again.');
     } finally {
       setIsSharingSpot(false);
     }
@@ -402,10 +360,9 @@ function ParkingApp() {
       const clientId = await getClientId();
       await cancelMyActiveSpot({ client_id: clientId });
       setSharedSpot(null);
-      Alert.alert('Signal cancelled', 'Your active parking signal was removed.');
     } catch (error) {
       console.error(error);
-      Alert.alert('Could not cancel signal', 'Check your connection and try again.');
+      Alert.alert('Could not cancel', 'Check your connection and try again.');
     } finally {
       setIsCancellingSpot(false);
     }
@@ -413,15 +370,13 @@ function ParkingApp() {
 
   if (screen === 'locating') {
     return (
-      <View style={styles.loadingScreen}>
+      <View style={styles.centerScreen}>
         <StatusBar style="light" />
         <View style={styles.loadingOrb}>
-          <ActivityIndicator size="large" color="#22c55e" />
+          <ActivityIndicator size="large" color={colors.green} />
         </View>
-        <Text style={styles.loadingTitle}>Getting a clean fix</Text>
-        <Text style={styles.loadingCopy}>
-          We are centering the map around you before showing nearby parking signals.
-        </Text>
+        <Text style={styles.centerTitle}>Finding you</Text>
+        <Text style={styles.centerCopy}>One second. We are opening the map.</Text>
       </View>
     );
   }
@@ -430,28 +385,24 @@ function ParkingApp() {
     return (
       <View
         style={[
-          styles.errorScreen,
+          styles.centerScreen,
           {
-            paddingTop: insets.top + 32,
+            paddingTop: insets.top + 28,
             paddingBottom: insets.bottom + 28,
           },
         ]}
       >
         <StatusBar style="light" />
         <View style={styles.errorIcon}>
-          <Ionicons name="location" size={30} color="#f97316" />
+          <Ionicons name="location" size={28} color={colors.orange} />
         </View>
-        <Text style={styles.errorTitle}>Location is off</Text>
-        <Text style={styles.errorCopy}>{errorMsg}</Text>
+        <Text style={styles.centerTitle}>Location is off</Text>
+        <Text style={styles.centerCopy}>{errorMsg}</Text>
         <Pressable style={styles.primaryButton} onPress={() => prepareMap(intent)}>
-          <Ionicons name="navigate" size={20} color="#ffffff" />
-          <Text style={styles.primaryButtonText}>Try Again</Text>
+          <Text style={styles.primaryButtonText}>Try again</Text>
         </Pressable>
-        <Pressable style={styles.secondaryDarkButton} onPress={() => Linking.openSettings()}>
-          <Text style={styles.secondaryDarkButtonText}>Open Settings</Text>
-        </Pressable>
-        <Pressable style={styles.textButton} onPress={() => setScreen('menu')}>
-          <Text style={styles.textButtonLabel}>Back to menu</Text>
+        <Pressable style={styles.softButton} onPress={() => Linking.openSettings()}>
+          <Text style={styles.softButtonText}>Open settings</Text>
         </Pressable>
       </View>
     );
@@ -460,35 +411,32 @@ function ParkingApp() {
   if (screen === 'map' && region) {
     return (
       <View style={styles.mapScreen}>
-        <StatusBar style="dark" />
+        <StatusBar style="light" />
         <MapView
           style={styles.map}
           provider={PROVIDER_DEFAULT}
           region={region}
+          onRegionChangeComplete={setRegion}
           showsUserLocation
           showsMyLocationButton={false}
-          userInterfaceStyle="light"
+          userInterfaceStyle="dark"
         >
-          {parkingSignals.map((signal) => (
-            <Marker
-              key={signal.id}
-              coordinate={signal.coordinate}
-              title={signal.title}
-              description={signal.subtitle}
-            >
-              <View
-                style={[
-                  styles.signalMarker,
-                  {
-                    backgroundColor: signalTypes[signal.type].color,
-                    borderColor: signalTypes[signal.type].softColor,
-                  },
-                ]}
+          {parkingSignals.map((signal) => {
+            const signalStyle = signalTypes[signal.type];
+
+            return (
+              <Marker
+                key={signal.id}
+                coordinate={signal.coordinate}
+                title={signal.title}
+                description={signal.subtitle}
               >
-                <Text style={styles.signalMarkerText}>{signal.confidence}</Text>
-              </View>
-            </Marker>
-          ))}
+                <View style={[styles.signalMarker, { backgroundColor: signalStyle.color }]}>
+                  <Ionicons name={signalStyle.icon} size={20} color={colors.white} />
+                </View>
+              </Marker>
+            );
+          })}
         </MapView>
 
         <View
@@ -501,29 +449,26 @@ function ParkingApp() {
             },
           ]}
         >
-          <Pressable style={styles.menuButton} onPress={() => setScreen('menu')}>
-            <Ionicons name="chevron-back" size={20} color="#111827" />
+          <Pressable style={styles.roundButton} onPress={() => setScreen('menu')}>
+            <Ionicons name="chevron-back" size={22} color={colors.white} />
           </Pressable>
           <View style={styles.mapTitlePill}>
-            <Text style={styles.mapEyebrow}>Live Parking Map</Text>
-            <Text style={styles.mapTitle}>ParkPilot</Text>
+            <Image source={park2MeSmallLogo} style={styles.mapHeaderLogo} resizeMode="contain" />
+            <Text style={styles.mapSubtitle}>
+              {intent === 'find'
+                ? activeSpots === undefined
+                  ? 'Finding parking'
+                  : `${parkingSignals.length} fresh spots`
+                : 'Give parking'}
+            </Text>
           </View>
-          <Pressable style={styles.menuButton} onPress={() => prepareMap(intent)}>
-            {isRefreshingLocation ? (
-              <ActivityIndicator size="small" color="#111827" />
+          <Pressable style={styles.roundButton} onPress={() => prepareMap(intent)}>
+            {isLocating ? (
+              <ActivityIndicator size="small" color={colors.white} />
             ) : (
-              <Ionicons name="locate" size={20} color="#111827" />
+              <Ionicons name="locate" size={21} color={colors.white} />
             )}
           </Pressable>
-        </View>
-
-        <View style={[styles.legendPill, { top: insets.top + 84, right: Math.max(16, width * 0.04) }]}>
-          {Object.entries(signalTypes).map(([key, signal]) => (
-            <View key={key} style={styles.legendItem}>
-              <View style={[styles.legendDot, { backgroundColor: signal.color }]} />
-              <Text style={styles.legendText}>{signal.label}</Text>
-            </View>
-          ))}
         </View>
 
         <View
@@ -531,106 +476,59 @@ function ParkingApp() {
             styles.commandPanel,
             {
               paddingBottom: insets.bottom + 18,
-              left: Math.max(14, width * 0.035),
-              right: Math.max(14, width * 0.035),
+              left: Math.max(12, width * 0.03),
+              right: Math.max(12, width * 0.03),
             },
           ]}
         >
           <View style={styles.panelHandle} />
-          <View style={styles.modeSwitch}>
-            <ModeButton
-              active={intent === 'find'}
-              icon="search"
-              label="Find"
-              onPress={() => setIntent('find')}
-            />
-            <ModeButton
-              active={intent === 'leave'}
-              icon="car"
-              label="Leaving"
-              onPress={() => setIntent('leave')}
-            />
-          </View>
 
           {intent === 'find' ? (
             <View style={styles.panelBody}>
-              <View style={styles.panelHeader}>
-                <View>
-                  <Text style={styles.panelLabel}>Best nearby lead</Text>
-                  <Text style={styles.panelTitle}>{highlightedSignal?.title || 'No signals yet'}</Text>
-                </View>
-                <View style={styles.confidenceBadge}>
-                  <Text style={styles.confidenceText}>{highlightedSignal?.confidence || '--'}</Text>
-                </View>
-              </View>
-              <View style={styles.signalDetailRow}>
-                <SignalDetail icon="walk" label={highlightedSignal?.distance || 'Nearby'} />
-                <SignalDetail icon="shield-checkmark" label={locationAccuracy} />
-                <SignalDetail icon="flash" label="Fast scan" />
-              </View>
+              <Text style={styles.panelTitle}>{bestSignal ? bestSignal.title : 'No fresh spots yet'}</Text>
+              <Text style={styles.panelCopy}>
+                {bestSignal ? `${bestSignal.subtitle} away` : 'Leave the map open. New spots appear automatically.'}
+              </Text>
               <Pressable style={styles.primaryButton} onPress={handleFindParking}>
-                <Ionicons name="navigate" size={20} color="#ffffff" />
-                <Text style={styles.primaryButtonText}>Scan This Area</Text>
+                <Ionicons name="sparkles" size={20} color={colors.black} />
+                <Text style={styles.primaryButtonText}>{bestSignal ? 'Show me' : 'Keep looking'}</Text>
               </Pressable>
             </View>
           ) : (
             <View style={styles.panelBody}>
-              <View style={styles.panelHeader}>
-                <View>
-                  <Text style={styles.panelLabel}>Share your spot</Text>
-                  <Text style={styles.panelTitle}>
-                    {sharedSpotDisplay ? 'Your signal is live' : 'When are you leaving?'}
-                  </Text>
-                </View>
-                <View style={styles.privacyBadge}>
-                  <Ionicons name="lock-closed" size={14} color="#0f172a" />
-                  <Text style={styles.privacyText}>Plate hidden</Text>
-                </View>
-              </View>
-              {sharedSpotDisplay && (
-                <View
-                  style={[
-                    styles.liveSignalCard,
-                    {
-                      backgroundColor: signalTypes[sharedSpotDisplay.status].softColor,
-                      borderColor: signalTypes[sharedSpotDisplay.status].color,
-                    },
-                  ]}
-                >
-                  <View style={styles.liveSignalHeader}>
-                    <View
-                      style={[
-                        styles.liveSignalIcon,
-                        { backgroundColor: signalTypes[sharedSpotDisplay.status].color },
-                      ]}
-                    >
-                      <Ionicons
-                        name={signalTypes[sharedSpotDisplay.status].icon}
-                        size={18}
-                        color="#ffffff"
-                      />
-                    </View>
-                    <View style={styles.liveSignalTextWrap}>
-                      <Text style={styles.liveSignalTitle}>{sharedSpotDisplay.title}</Text>
-                      <Text style={styles.liveSignalCopy}>{sharedSpotDisplay.copy}</Text>
-                    </View>
+              {sharedSpotDisplay ? (
+                <View style={styles.liveCard}>
+                  <View
+                    style={[
+                      styles.liveDot,
+                      {
+                        backgroundColor: signalTypes[sharedSpotDisplay.status].color,
+                      },
+                    ]}
+                  />
+                  <View style={styles.liveText}>
+                    <Text style={styles.panelTitle}>{sharedSpotDisplay.title}</Text>
+                    <Text style={styles.panelCopy}>{sharedSpotDisplay.copy}</Text>
                   </View>
                   <Pressable
-                    style={[styles.cancelSignalButton, isCancellingSpot && styles.primaryButtonDisabled]}
+                    style={styles.cancelButton}
                     onPress={handleCancelSharedSpot}
                     disabled={isCancellingSpot}
                   >
                     {isCancellingSpot ? (
-                      <ActivityIndicator size="small" color="#0f172a" />
+                      <ActivityIndicator size="small" color={colors.white} />
                     ) : (
-                      <Ionicons name="close-circle" size={17} color="#0f172a" />
+                      <Ionicons name="close" size={18} color={colors.white} />
                     )}
-                    <Text style={styles.cancelSignalText}>
-                      {isCancellingSpot ? 'Cancelling...' : 'Cancel signal'}
-                    </Text>
                   </Pressable>
                 </View>
+              ) : (
+                <>
+                  <Text style={styles.panelTitle}>Leaving soon?</Text>
+                  <Text style={styles.panelCopy}>Pick when your spot opens.</Text>
+                </>
               )}
+
               <View style={styles.timeRow}>
                 {departureTimes.map((minutes) => (
                   <Pressable
@@ -644,34 +542,24 @@ function ParkingApp() {
                   </Pressable>
                 ))}
               </View>
+
               <Pressable
-                style={[styles.primaryButton, isSharingSpot && styles.primaryButtonDisabled]}
+                style={[styles.primaryButton, isSharingSpot && styles.buttonDisabled]}
                 onPress={() => handleDropPin(selectedTime)}
                 disabled={isSharingSpot}
               >
                 {isSharingSpot ? (
-                  <ActivityIndicator size="small" color="#ffffff" />
+                  <ActivityIndicator size="small" color={colors.black} />
                 ) : (
-                  <Ionicons name="radio" size={20} color="#ffffff" />
+                  <Ionicons name="radio" size={20} color={colors.black} />
                 )}
-                <Text style={styles.primaryButtonText}>
-                  {isSharingSpot
-                    ? 'Saving Signal...'
-                    : sharedSpotDisplay
-                      ? 'Update Departure Signal'
-                      : 'Drop Departure Signal'}
-                </Text>
+                <Text style={styles.primaryButtonText}>{sharedSpotDisplay ? 'Update time' : 'Share my spot'}</Text>
               </Pressable>
             </View>
           )}
 
-          {!isCompact && (
-            <View style={styles.bottomHint}>
-              <Ionicons name="information-circle" size={16} color="#64748b" />
-              <Text style={styles.bottomHintText}>
-                Green signals are current exits. Amber needs a quick visual check. Red is low confidence.
-              </Text>
-            </View>
+          {!panelIsCompact && (
+            <Text style={styles.tinyNote}>{intent === 'leave' ? 'Shared spots disappear on their own.' : 'Simple. Fresh. Nearby.'}</Text>
           )}
         </View>
       </View>
@@ -692,200 +580,111 @@ function ParkingApp() {
     >
       <StatusBar style="light" />
       <View style={styles.brandRow}>
-        <View style={styles.brandMark}>
-          <Ionicons name="car-sport" size={26} color="#0f172a" />
-        </View>
-        <View>
-          <Text style={styles.brandName}>ParkPilot</Text>
-          <Text style={styles.brandTagline}>Parking signals, not guesswork</Text>
-        </View>
+        <Image source={park2MeSmallLogo} style={styles.brandLogo} resizeMode="contain" />
       </View>
 
       <View style={styles.heroCard}>
-        <View style={styles.heroBadge}>
-          <Ionicons name="sparkles" size={16} color="#bbf7d0" />
-          <Text style={styles.heroBadgeText}>Smart start menu</Text>
-        </View>
-        <Text style={styles.heroTitle}>Where should we help first?</Text>
-        <Text style={styles.heroCopy}>
-          Find a fresh spot nearby or help the next driver by sharing when your space opens.
-        </Text>
-        <View style={styles.heroMapPreview}>
-          <View style={[styles.previewStreet, styles.previewStreetOne]} />
-          <View style={[styles.previewStreet, styles.previewStreetTwo]} />
-          <View style={[styles.previewStreet, styles.previewStreetThree]} />
-          <View style={[styles.previewPin, styles.previewPinStrong]}>
-            <Text style={styles.previewPinText}>92</Text>
-          </View>
-          <View style={[styles.previewPin, styles.previewPinWatch]}>
-            <Text style={styles.previewPinText}>68</Text>
-          </View>
-          <View style={[styles.previewPin, styles.previewPinStale]}>
-            <Text style={styles.previewPinText}>31</Text>
-          </View>
-        </View>
+        <View style={styles.heroGlow} />
+        <Text style={styles.heroTitle}>Park easier.</Text>
+        <Text style={styles.heroCopy}>Find a spot or give yours when you leave.</Text>
       </View>
 
-      <View style={styles.primaryActionGrid}>
+      <View style={styles.menuActions}>
         <MenuAction
           icon="search"
-          title="Find parking"
-          copy="Open the live map and rank the strongest nearby leads."
-          accent="#22c55e"
+          title="Find a spot"
+          copy="Open the map."
           onPress={() => prepareMap('find')}
         />
         <MenuAction
           icon="car"
-          title="I am leaving"
-          copy="Share a private departure signal for drivers nearby."
-          accent="#2563eb"
+          title="Give parking"
+          copy="Help another driver."
           onPress={() => prepareMap('leave')}
         />
       </View>
 
-      <View style={styles.sectionHeader}>
-        <Text style={styles.sectionTitle}>Current pulse</Text>
-        <Text style={styles.sectionMeta}>Demo signals</Text>
-      </View>
-      <View style={styles.metricsRow}>
-        {menuSignals.map((item) => (
-          <View key={item.label} style={styles.metricCard}>
-            <View style={[styles.metricDot, { backgroundColor: signalTypes[item.tone].color }]} />
-            <Text style={styles.metricValue}>{item.value}</Text>
-            <Text style={styles.metricLabel}>{item.label}</Text>
-          </View>
-        ))}
-      </View>
-
-      <View style={styles.intelligenceCard}>
-        <View style={styles.intelligenceHeader}>
-          <Ionicons name="analytics" size={20} color="#22c55e" />
-          <Text style={styles.intelligenceTitle}>Signal intelligence</Text>
-        </View>
-        <SignalRow tone="green" label="Green" copy="Confirmed departures and high-confidence openings." />
-        <SignalRow tone="orange" label="Amber" copy="Useful hints that need a quick visual check." />
-        <SignalRow tone="red" label="Red" copy="Older reports kept visible so you do not waste time." />
+      <View style={styles.simplePromise}>
+        <Ionicons name="leaf" size={20} color={colors.green} />
+        <Text style={styles.simplePromiseText}>Fresh spots only. No clutter.</Text>
       </View>
     </ScrollView>
   );
 }
 
-function MenuAction({ accent, copy, icon, onPress, title }) {
+function MenuAction({ copy, icon, onPress, title }) {
   return (
     <Pressable style={styles.menuAction} onPress={onPress}>
-      <View style={[styles.menuActionIcon, { backgroundColor: accent }]}>
-        <Ionicons name={icon} size={22} color="#ffffff" />
+      <View style={styles.menuActionIcon}>
+        <Ionicons name={icon} size={23} color={colors.black} />
       </View>
-      <Text style={styles.menuActionTitle}>{title}</Text>
-      <Text style={styles.menuActionCopy}>{copy}</Text>
-      <View style={styles.menuActionFooter}>
-        <Text style={styles.menuActionFooterText}>Start</Text>
-        <Ionicons name="arrow-forward" size={16} color="#0f172a" />
+      <View style={styles.menuActionText}>
+        <Text style={styles.menuActionTitle}>{title}</Text>
+        <Text style={styles.menuActionCopy}>{copy}</Text>
       </View>
+      <Ionicons name="arrow-forward" size={20} color={colors.green} />
     </Pressable>
-  );
-}
-
-function ModeButton({ active, icon, label, onPress }) {
-  return (
-    <Pressable style={[styles.modeButton, active && styles.modeButtonActive]} onPress={onPress}>
-      <Ionicons name={icon} size={18} color={active ? '#ffffff' : '#475569'} />
-      <Text style={[styles.modeButtonText, active && styles.modeButtonTextActive]}>{label}</Text>
-    </Pressable>
-  );
-}
-
-function SignalDetail({ icon, label }) {
-  return (
-    <View style={styles.signalDetail}>
-      <Ionicons name={icon} size={15} color="#16a34a" />
-      <Text style={styles.signalDetailText}>{label}</Text>
-    </View>
-  );
-}
-
-function SignalRow({ copy, label, tone }) {
-  const signal = signalTypes[tone];
-
-  return (
-    <View style={styles.signalRow}>
-      <View style={[styles.signalRowIcon, { backgroundColor: signal.softColor }]}>
-        <Ionicons name={signal.icon} size={18} color={signal.color} />
-      </View>
-      <View style={styles.signalRowText}>
-        <Text style={styles.signalRowLabel}>{label}</Text>
-        <Text style={styles.signalRowCopy}>{copy}</Text>
-      </View>
-    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  loadingScreen: {
+  introScreen: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 18,
+    backgroundColor: colors.black,
+  },
+  introLogo: {
+    width: '100%',
+    height: '92%',
+    borderRadius: 30,
+  },
+  centerScreen: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     gap: 14,
     padding: 28,
-    backgroundColor: '#101514',
+    backgroundColor: colors.black,
   },
   loadingOrb: {
-    width: 88,
-    height: 88,
+    width: 86,
+    height: 86,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 44,
-    backgroundColor: '#17211f',
+    borderRadius: 43,
+    backgroundColor: colors.panelSoft,
     borderWidth: 1,
-    borderColor: '#23443a',
-  },
-  loadingTitle: {
-    color: '#f8fafc',
-    fontSize: 24,
-    fontWeight: '800',
-    letterSpacing: 0,
-  },
-  loadingCopy: {
-    maxWidth: 300,
-    color: '#a7b2ad',
-    fontSize: 15,
-    lineHeight: 22,
-    textAlign: 'center',
-  },
-  errorScreen: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 14,
-    paddingHorizontal: 26,
-    backgroundColor: '#101514',
+    borderColor: colors.border,
   },
   errorIcon: {
     width: 74,
     height: 74,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 24,
-    backgroundColor: '#1f1710',
+    borderRadius: 26,
+    backgroundColor: colors.panelSoft,
     borderWidth: 1,
-    borderColor: '#7c2d12',
+    borderColor: colors.border,
   },
-  errorTitle: {
-    color: '#ffffff',
+  centerTitle: {
+    color: colors.white,
     fontSize: 28,
-    fontWeight: '800',
+    fontWeight: '900',
+    letterSpacing: 0,
     textAlign: 'center',
   },
-  errorCopy: {
-    maxWidth: 320,
-    color: '#b8c2bd',
-    fontSize: 15,
-    lineHeight: 22,
+  centerCopy: {
+    maxWidth: 300,
+    color: colors.muted,
+    fontSize: 16,
+    lineHeight: 23,
     textAlign: 'center',
   },
   menuScreen: {
     flex: 1,
-    backgroundColor: '#101514',
+    backgroundColor: colors.black,
   },
   menuContent: {
     gap: 18,
@@ -894,258 +693,105 @@ const styles = StyleSheet.create({
   brandRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    minHeight: 58,
   },
-  brandMark: {
-    width: 50,
-    height: 50,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 18,
-    backgroundColor: '#bbf7d0',
-  },
-  brandName: {
-    color: '#f8fafc',
-    fontSize: 22,
-    fontWeight: '900',
-    letterSpacing: 0,
-  },
-  brandTagline: {
-    color: '#9ca9a4',
-    fontSize: 13,
-    fontWeight: '600',
+  brandLogo: {
+    width: 176,
+    height: 58,
   },
   heroCard: {
-    gap: 16,
+    minHeight: 270,
+    justifyContent: 'flex-end',
+    gap: 12,
     overflow: 'hidden',
-    padding: 20,
-    borderRadius: 28,
+    padding: 22,
+    borderRadius: 30,
+    backgroundColor: colors.panel,
     borderWidth: 1,
-    borderColor: '#253430',
-    backgroundColor: '#17211f',
-    boxShadow: '0 18px 42px rgba(0, 0, 0, 0.25)',
+    borderColor: colors.border,
+    boxShadow: '0 22px 44px rgba(0, 0, 0, 0.35)',
   },
-  heroBadge: {
-    alignSelf: 'flex-start',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 999,
-    backgroundColor: '#20322d',
-  },
-  heroBadgeText: {
-    color: '#bbf7d0',
-    fontSize: 12,
-    fontWeight: '800',
-    textTransform: 'uppercase',
-    letterSpacing: 0.7,
+  heroGlow: {
+    position: 'absolute',
+    top: 28,
+    right: -36,
+    width: 220,
+    height: 220,
+    borderRadius: 110,
+    backgroundColor: colors.green,
+    opacity: 0.22,
   },
   heroTitle: {
-    color: '#ffffff',
-    fontSize: 38,
+    color: colors.white,
+    fontSize: 52,
     fontWeight: '900',
-    lineHeight: 42,
+    lineHeight: 56,
     letterSpacing: 0,
   },
   heroCopy: {
-    color: '#c7d2cc',
-    fontSize: 16,
+    maxWidth: 280,
+    color: colors.muted,
+    fontSize: 17,
     lineHeight: 24,
+    fontWeight: '700',
   },
-  heroMapPreview: {
-    height: 170,
-    overflow: 'hidden',
-    borderRadius: 22,
-    backgroundColor: '#e9efe9',
-    borderWidth: 1,
-    borderColor: '#d6ded7',
-  },
-  previewStreet: {
-    position: 'absolute',
-    height: 18,
-    borderRadius: 999,
-    backgroundColor: '#ffffff',
-  },
-  previewStreetOne: {
-    top: 38,
-    left: -28,
-    right: 24,
-    transform: [{ rotate: '-10deg' }],
-  },
-  previewStreetTwo: {
-    top: 86,
-    left: 34,
-    right: -24,
-    transform: [{ rotate: '18deg' }],
-  },
-  previewStreetThree: {
-    top: 126,
-    left: -10,
-    right: 56,
-    transform: [{ rotate: '-4deg' }],
-  },
-  previewPin: {
-    position: 'absolute',
-    width: 48,
-    height: 48,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 24,
-    borderWidth: 4,
-    borderColor: '#ffffff',
-  },
-  previewPinStrong: {
-    top: 42,
-    right: 54,
-    backgroundColor: '#16a34a',
-  },
-  previewPinWatch: {
-    bottom: 34,
-    left: 46,
-    backgroundColor: '#f59e0b',
-  },
-  previewPinStale: {
-    top: 24,
-    left: 70,
-    backgroundColor: '#ef4444',
-  },
-  previewPinText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '900',
-  },
-  primaryActionGrid: {
-    flexDirection: 'row',
+  menuActions: {
     gap: 12,
   },
   menuAction: {
-    flex: 1,
-    minHeight: 178,
-    gap: 11,
+    minHeight: 84,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
     padding: 16,
     borderRadius: 24,
-    backgroundColor: '#f8fafc',
-    boxShadow: '0 14px 30px rgba(0, 0, 0, 0.22)',
+    backgroundColor: colors.panelSoft,
+    borderWidth: 1,
+    borderColor: colors.border,
   },
   menuActionIcon: {
-    width: 44,
-    height: 44,
+    width: 52,
+    height: 52,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 16,
+    borderRadius: 19,
+    backgroundColor: colors.green,
+  },
+  menuActionText: {
+    flex: 1,
+    gap: 3,
   },
   menuActionTitle: {
-    color: '#0f172a',
-    fontSize: 18,
+    color: colors.white,
+    fontSize: 19,
     fontWeight: '900',
     letterSpacing: 0,
   },
   menuActionCopy: {
-    flex: 1,
-    color: '#64748b',
-    fontSize: 13,
-    lineHeight: 19,
-  },
-  menuActionFooter: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  menuActionFooterText: {
-    color: '#0f172a',
-    fontSize: 13,
-    fontWeight: '900',
-  },
-  sectionHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  sectionTitle: {
-    color: '#f8fafc',
-    fontSize: 18,
-    fontWeight: '900',
-  },
-  sectionMeta: {
-    color: '#9ca9a4',
-    fontSize: 13,
+    color: colors.muted,
+    fontSize: 14,
     fontWeight: '700',
   },
-  metricsRow: {
+  simplePromise: {
     flexDirection: 'row',
-    gap: 10,
-  },
-  metricCard: {
-    flex: 1,
-    gap: 8,
-    padding: 14,
-    borderRadius: 20,
-    backgroundColor: '#17211f',
+    alignItems: 'center',
+    gap: 9,
+    padding: 16,
+    borderRadius: 22,
+    backgroundColor: colors.panel,
     borderWidth: 1,
-    borderColor: '#253430',
+    borderColor: colors.border,
   },
-  metricDot: {
-    width: 9,
-    height: 9,
-    borderRadius: 5,
-  },
-  metricValue: {
-    color: '#ffffff',
-    fontSize: 24,
-    fontWeight: '900',
-    fontVariant: ['tabular-nums'],
-  },
-  metricLabel: {
-    color: '#9ca9a4',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  intelligenceCard: {
-    gap: 14,
-    padding: 18,
-    borderRadius: 24,
-    backgroundColor: '#f8fafc',
-  },
-  intelligenceHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  intelligenceTitle: {
-    color: '#0f172a',
-    fontSize: 18,
-    fontWeight: '900',
-  },
-  signalRow: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  signalRowIcon: {
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 14,
-  },
-  signalRowText: {
+  simplePromiseText: {
     flex: 1,
-    gap: 2,
-  },
-  signalRowLabel: {
-    color: '#0f172a',
-    fontSize: 15,
-    fontWeight: '900',
-  },
-  signalRowCopy: {
-    color: '#64748b',
-    fontSize: 13,
-    lineHeight: 18,
+    color: colors.muted,
+    fontSize: 14,
+    lineHeight: 20,
+    fontWeight: '700',
   },
   mapScreen: {
     flex: 1,
-    backgroundColor: '#e8eee9',
+    backgroundColor: colors.black,
   },
   map: {
     flex: 1,
@@ -1157,72 +803,47 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 10,
   },
-  menuButton: {
-    width: 48,
-    height: 48,
+  roundButton: {
+    width: 50,
+    height: 50,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 18,
-    backgroundColor: '#ffffff',
-    boxShadow: '0 10px 24px rgba(15, 23, 42, 0.18)',
+    borderRadius: 20,
+    backgroundColor: colors.panel,
+    borderWidth: 1,
+    borderColor: colors.border,
+    boxShadow: '0 12px 28px rgba(0, 0, 0, 0.3)',
   },
   mapTitlePill: {
     flex: 1,
-    gap: 1,
+    alignItems: 'flex-start',
+    gap: 2,
     paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 18,
-    backgroundColor: '#ffffff',
-    boxShadow: '0 10px 24px rgba(15, 23, 42, 0.18)',
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: colors.panel,
+    borderWidth: 1,
+    borderColor: colors.border,
+    boxShadow: '0 12px 28px rgba(0, 0, 0, 0.3)',
   },
-  mapEyebrow: {
-    color: '#64748b',
-    fontSize: 11,
+  mapHeaderLogo: {
+    width: 118,
+    height: 34,
+  },
+  mapSubtitle: {
+    color: colors.green,
+    fontSize: 12,
     fontWeight: '900',
-    textTransform: 'uppercase',
-    letterSpacing: 0.6,
-  },
-  mapTitle: {
-    color: '#0f172a',
-    fontSize: 18,
-    fontWeight: '900',
-  },
-  legendPill: {
-    position: 'absolute',
-    gap: 8,
-    padding: 12,
-    borderRadius: 18,
-    backgroundColor: '#ffffff',
-    boxShadow: '0 10px 24px rgba(15, 23, 42, 0.16)',
-  },
-  legendItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 7,
-  },
-  legendDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-  },
-  legendText: {
-    color: '#334155',
-    fontSize: 11,
-    fontWeight: '800',
   },
   signalMarker: {
-    width: 54,
-    height: 54,
+    width: 46,
+    height: 46,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 27,
+    borderRadius: 23,
     borderWidth: 4,
-    boxShadow: '0 8px 18px rgba(15, 23, 42, 0.24)',
-  },
-  signalMarkerText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '900',
+    borderColor: colors.black,
+    boxShadow: '0 8px 18px rgba(0, 0, 0, 0.32)',
   },
   commandPanel: {
     position: 'absolute',
@@ -1230,237 +851,126 @@ const styles = StyleSheet.create({
     gap: 14,
     paddingTop: 10,
     paddingHorizontal: 16,
-    borderTopLeftRadius: 30,
-    borderTopRightRadius: 30,
-    backgroundColor: '#ffffff',
-    boxShadow: '0 -18px 42px rgba(15, 23, 42, 0.2)',
+    borderTopLeftRadius: 32,
+    borderTopRightRadius: 32,
+    backgroundColor: colors.black,
+    borderWidth: 1,
+    borderColor: colors.border,
+    boxShadow: '0 -22px 42px rgba(0, 0, 0, 0.42)',
   },
   panelHandle: {
     alignSelf: 'center',
-    width: 44,
+    width: 42,
     height: 5,
     borderRadius: 3,
-    backgroundColor: '#d1d5db',
-  },
-  modeSwitch: {
-    flexDirection: 'row',
-    gap: 8,
-    padding: 5,
-    borderRadius: 20,
-    backgroundColor: '#eef2f0',
-  },
-  modeButton: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-    paddingVertical: 11,
-    borderRadius: 16,
-  },
-  modeButtonActive: {
-    backgroundColor: '#101514',
-  },
-  modeButtonText: {
-    color: '#475569',
-    fontSize: 14,
-    fontWeight: '900',
-  },
-  modeButtonTextActive: {
-    color: '#ffffff',
+    backgroundColor: colors.panelRaised,
   },
   panelBody: {
     gap: 14,
   },
-  panelHeader: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    justifyContent: 'space-between',
-    gap: 12,
-  },
-  panelLabel: {
-    color: '#64748b',
-    fontSize: 12,
-    fontWeight: '900',
-    textTransform: 'uppercase',
-    letterSpacing: 0.6,
-  },
   panelTitle: {
-    color: '#0f172a',
-    fontSize: 21,
+    color: colors.white,
+    fontSize: 27,
     fontWeight: '900',
     letterSpacing: 0,
   },
-  confidenceBadge: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 16,
-    backgroundColor: '#dcfce7',
+  panelCopy: {
+    color: colors.muted,
+    fontSize: 15,
+    lineHeight: 21,
+    fontWeight: '700',
   },
-  confidenceText: {
-    color: '#166534',
+  liveCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    padding: 14,
+    borderRadius: 22,
+    backgroundColor: colors.panelSoft,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  liveDot: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+  },
+  liveText: {
+    flex: 1,
+    gap: 2,
+  },
+  cancelButton: {
+    width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 16,
+    backgroundColor: colors.panelRaised,
+  },
+  timeRow: {
+    flexDirection: 'row',
+    gap: 9,
+  },
+  timeChip: {
+    flex: 1,
+    minHeight: 54,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 18,
+    backgroundColor: colors.panelSoft,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  timeChipActive: {
+    backgroundColor: colors.greenSoft,
+    borderColor: colors.green,
+  },
+  timeChipText: {
+    color: colors.muted,
     fontSize: 16,
     fontWeight: '900',
     fontVariant: ['tabular-nums'],
   },
-  signalDetailRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  signalDetail: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 999,
-    backgroundColor: '#f1f5f3',
-  },
-  signalDetailText: {
-    color: '#334155',
-    fontSize: 12,
-    fontWeight: '800',
+  timeChipTextActive: {
+    color: colors.green,
   },
   primaryButton: {
-    minHeight: 54,
+    minHeight: 58,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 9,
     paddingHorizontal: 18,
-    borderRadius: 18,
-    backgroundColor: '#16a34a',
-  },
-  primaryButtonDisabled: {
-    opacity: 0.7,
+    borderRadius: 20,
+    backgroundColor: colors.green,
   },
   primaryButtonText: {
-    color: '#ffffff',
-    fontSize: 16,
+    color: colors.black,
+    fontSize: 17,
     fontWeight: '900',
   },
-  secondaryDarkButton: {
+  softButton: {
     minHeight: 52,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 18,
     borderRadius: 18,
-    backgroundColor: '#1f2a27',
+    backgroundColor: colors.panelSoft,
     borderWidth: 1,
-    borderColor: '#33443f',
+    borderColor: colors.border,
   },
-  secondaryDarkButtonText: {
-    color: '#f8fafc',
+  softButtonText: {
+    color: colors.white,
     fontSize: 15,
     fontWeight: '900',
   },
-  textButton: {
-    padding: 10,
+  buttonDisabled: {
+    opacity: 0.72,
   },
-  textButtonLabel: {
-    color: '#bbf7d0',
-    fontSize: 14,
-    fontWeight: '900',
-  },
-  privacyBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 999,
-    backgroundColor: '#e2e8f0',
-  },
-  privacyText: {
-    color: '#0f172a',
-    fontSize: 12,
-    fontWeight: '900',
-  },
-  liveSignalCard: {
-    gap: 12,
-    padding: 13,
-    borderRadius: 18,
-    borderWidth: 1,
-  },
-  liveSignalHeader: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 10,
-  },
-  liveSignalIcon: {
-    width: 36,
-    height: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 13,
-  },
-  liveSignalTextWrap: {
-    flex: 1,
-    gap: 2,
-  },
-  liveSignalTitle: {
-    color: '#0f172a',
-    fontSize: 16,
-    fontWeight: '900',
-  },
-  liveSignalCopy: {
-    color: '#334155',
-    fontSize: 12,
-    lineHeight: 17,
-    fontWeight: '700',
-  },
-  cancelSignalButton: {
-    minHeight: 40,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 7,
-    borderRadius: 14,
-    backgroundColor: 'rgba(255, 255, 255, 0.65)',
-  },
-  cancelSignalText: {
-    color: '#0f172a',
+  tinyNote: {
+    color: colors.dim,
     fontSize: 13,
-    fontWeight: '900',
-  },
-  timeRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  timeChip: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 12,
-    borderRadius: 16,
-    backgroundColor: '#eef2f0',
-    borderWidth: 1,
-    borderColor: '#dbe4df',
-  },
-  timeChipActive: {
-    backgroundColor: '#dcfce7',
-    borderColor: '#22c55e',
-  },
-  timeChipText: {
-    color: '#475569',
-    fontSize: 14,
-    fontWeight: '900',
-    fontVariant: ['tabular-nums'],
-  },
-  timeChipTextActive: {
-    color: '#166534',
-  },
-  bottomHint: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 7,
-    paddingTop: 2,
-  },
-  bottomHintText: {
-    flex: 1,
-    color: '#64748b',
-    fontSize: 12,
-    lineHeight: 17,
+    fontWeight: '800',
+    textAlign: 'center',
   },
 });
