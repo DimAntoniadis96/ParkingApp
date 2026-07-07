@@ -56,9 +56,14 @@ const signalTypes = {
 
 const departureTimes = [2, 5, 8];
 const CLIENT_ID_STORAGE_KEY = 'park2me.clientId';
-const ACTIVE_QUERY_LIMIT = 90;
+const DRAFT_SPOT_STORAGE_KEY = 'park2me.draftSpot';
+const ACTIVE_QUERY_LIMIT = 60;
+const MAP_QUERY_CELL_SIZE_DEGREES = 0.01;
 const EXPIRE_AFTER_DEPARTURE_MS = 12 * 60 * 1000;
 const ORANGE_AFTER_DEPARTURE_MS = 5 * 60 * 1000;
+const DRAFT_SPOT_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const SPOT_VERIFICATION_RADIUS_METERS = 80;
+const LOCATION_ACCURACY_BUFFER_METERS = 35;
 const DEFAULT_CAR_INFO = {
   brand: 'Private vehicle',
   color: 'Hidden',
@@ -104,6 +109,33 @@ function createRegion(coords) {
   };
 }
 
+function mapAreaKey(latitude, longitude) {
+  const latCell = Math.floor(latitude / MAP_QUERY_CELL_SIZE_DEGREES);
+  const lonCell = Math.floor(longitude / MAP_QUERY_CELL_SIZE_DEGREES);
+
+  return `${latCell}:${lonCell}`;
+}
+
+function toCoordinate(coords) {
+  return {
+    latitude: coords.latitude,
+    longitude: coords.longitude,
+  };
+}
+
+function distanceBetweenCoordinatesMeters(from, to) {
+  const earthRadiusMeters = 6371000;
+  const latitudeDelta = ((to.latitude - from.latitude) * Math.PI) / 180;
+  const longitudeDelta = ((to.longitude - from.longitude) * Math.PI) / 180;
+  const fromLatitude = (from.latitude * Math.PI) / 180;
+  const toLatitude = (to.latitude * Math.PI) / 180;
+  const haversine =
+    Math.sin(latitudeDelta / 2) ** 2 +
+    Math.cos(fromLatitude) * Math.cos(toLatitude) * Math.sin(longitudeDelta / 2) ** 2;
+
+  return 2 * earthRadiusMeters * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+}
+
 function getStatusForTime(now, scheduledDepartureTime) {
   if (now < scheduledDepartureTime) {
     return 'green';
@@ -120,6 +152,12 @@ function formatMinutes(milliseconds) {
   const minutes = Math.max(0, Math.ceil(milliseconds / 60000));
 
   return minutes === 1 ? '1 min' : `${minutes} min`;
+}
+
+function formatDistanceMeters(distance) {
+  const roundedDistance = Math.round(distance);
+
+  return roundedDistance < 1000 ? `${roundedDistance} m` : `${(roundedDistance / 1000).toFixed(1)} km`;
 }
 
 function formatDistanceFromRegion(spot, region) {
@@ -174,6 +212,54 @@ function mapConvexSpotToSignal(spot, region, now) {
   };
 }
 
+function parseDraftSpot(rawDraftSpot) {
+  if (!rawDraftSpot) {
+    return null;
+  }
+
+  try {
+    const draftSpot = JSON.parse(rawDraftSpot);
+    const isCoordinate =
+      Number.isFinite(draftSpot?.latitude) && Number.isFinite(draftSpot?.longitude);
+    const isFresh =
+      typeof draftSpot?.updatedAt === 'number' &&
+      Date.now() - draftSpot.updatedAt <= DRAFT_SPOT_MAX_AGE_MS;
+
+    if (!isCoordinate || !isFresh) {
+      return null;
+    }
+
+    return {
+      latitude: draftSpot.latitude,
+      longitude: draftSpot.longitude,
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+async function loadDraftSpot() {
+  const rawDraftSpot = await AsyncStorage.getItem(DRAFT_SPOT_STORAGE_KEY);
+  const draftSpot = parseDraftSpot(rawDraftSpot);
+
+  if (rawDraftSpot && !draftSpot) {
+    await AsyncStorage.removeItem(DRAFT_SPOT_STORAGE_KEY);
+  }
+
+  return draftSpot;
+}
+
+async function saveDraftSpot(coordinate) {
+  await AsyncStorage.setItem(
+    DRAFT_SPOT_STORAGE_KEY,
+    JSON.stringify({
+      latitude: coordinate.latitude,
+      longitude: coordinate.longitude,
+      updatedAt: Date.now(),
+    }),
+  );
+}
+
 async function openMapUrl(primaryUrl, fallbackUrl) {
   try {
     await Linking.openURL(primaryUrl);
@@ -204,6 +290,8 @@ function ParkingApp() {
   const [intent, setIntent] = useState('find');
   const [location, setLocation] = useState(null);
   const [region, setRegion] = useState(null);
+  const [nearbyQueryPoint, setNearbyQueryPoint] = useState(null);
+  const [draftSpotCoordinate, setDraftSpotCoordinate] = useState(null);
   const [selectedTime, setSelectedTime] = useState(5);
   const [selectedSignalId, setSelectedSignalId] = useState(null);
   const [now, setNow] = useState(Date.now());
@@ -215,10 +303,10 @@ function ParkingApp() {
 
   const activeSpots = useQuery(
     api.parking.getNearbyActiveSpots,
-    region
+    intent === 'find' && nearbyQueryPoint
       ? {
-          latitude: region.latitude,
-          longitude: region.longitude,
+          latitude: nearbyQueryPoint.latitude,
+          longitude: nearbyQueryPoint.longitude,
           limit: ACTIVE_QUERY_LIMIT,
         }
       : 'skip',
@@ -227,16 +315,19 @@ function ParkingApp() {
   const cancelMyActiveSpot = useMutation(api.parking.cancelMyActiveSpot);
 
   const parkingSignals = useMemo(() => {
-    if (!activeSpots?.length) {
+    if (intent !== 'find' || !activeSpots?.length) {
       return [];
     }
 
     return activeSpots.map((spot) => mapConvexSpotToSignal(spot, region, now));
-  }, [activeSpots, now, region]);
-  const bestSignal = parkingSignals[0];
+  }, [activeSpots, intent, now, region]);
+  const bestSignal = intent === 'find' ? parkingSignals[0] : null;
   const selectedSignal = useMemo(
-    () => parkingSignals.find((signal) => signal.id === selectedSignalId),
-    [parkingSignals, selectedSignalId],
+    () =>
+      intent === 'find'
+        ? parkingSignals.find((signal) => signal.id === selectedSignalId)
+        : null,
+    [intent, parkingSignals, selectedSignalId],
   );
   const focusedSignal = selectedSignal || bestSignal;
   const sharedSpotDisplay = getSharedSpotDisplay(sharedSpot, now);
@@ -248,6 +339,24 @@ function ParkingApp() {
     }, 1400);
 
     return () => clearTimeout(introTimer);
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    loadDraftSpot()
+      .then((savedDraftSpot) => {
+        if (isMounted && savedDraftSpot) {
+          setDraftSpotCoordinate((currentDraftSpot) => currentDraftSpot || savedDraftSpot);
+        }
+      })
+      .catch((error) => {
+        console.error(error);
+      });
+
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -279,6 +388,38 @@ function ParkingApp() {
     );
   }
 
+  const handleDraftSpotChange = (coordinate) => {
+    const nextCoordinate = toCoordinate(coordinate);
+
+    setDraftSpotCoordinate(nextCoordinate);
+    saveDraftSpot(nextCoordinate).catch((error) => {
+      console.error(error);
+    });
+  };
+
+  const handleRegionChangeComplete = (nextRegion) => {
+    setRegion(nextRegion);
+
+    if (intent !== 'find') {
+      return;
+    }
+
+    setNearbyQueryPoint((currentPoint) => {
+      if (!currentPoint) {
+        return toCoordinate(nextRegion);
+      }
+
+      if (
+        mapAreaKey(currentPoint.latitude, currentPoint.longitude) ===
+        mapAreaKey(nextRegion.latitude, nextRegion.longitude)
+      ) {
+        return currentPoint;
+      }
+
+      return toCoordinate(nextRegion);
+    });
+  };
+
   const prepareMap = async (nextIntent = intent) => {
     setIntent(nextIntent);
     setErrorMsg('');
@@ -306,9 +447,23 @@ function ParkingApp() {
         (await Location.getCurrentPositionAsync({
           accuracy: Location.Accuracy.Balanced,
         }));
+      const currentCoordinate = toCoordinate(currentLocation.coords);
+      const nextRegion =
+        nextIntent === 'leave' && draftSpotCoordinate
+          ? createRegion(draftSpotCoordinate)
+          : createRegion(currentCoordinate);
 
       setLocation(currentLocation.coords);
-      setRegion(createRegion(currentLocation.coords));
+      setRegion(nextRegion);
+
+      if (nextIntent === 'find') {
+        setNearbyQueryPoint(currentCoordinate);
+      }
+
+      if (nextIntent === 'leave' && !draftSpotCoordinate) {
+        handleDraftSpotChange(currentCoordinate);
+      }
+
       setScreen('map');
     } catch (error) {
       setErrorMsg('We could not find you. Please try again.');
@@ -362,6 +517,14 @@ function ParkingApp() {
       return;
     }
 
+    if (!draftSpotCoordinate) {
+      Alert.alert(
+        'Place your car pin',
+        'Tap the map where your car is parked, then verify when you are near it.',
+      );
+      return;
+    }
+
     setIsSharingSpot(true);
 
     try {
@@ -373,22 +536,49 @@ function ParkingApp() {
       }
 
       const currentLocation = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.Balanced,
+        accuracy: Location.Accuracy.High,
       });
       const coords = currentLocation.coords;
-      const scheduledDepartureTime = Date.now() + minutes * 60 * 1000;
-      const expiresAt = scheduledDepartureTime + EXPIRE_AFTER_DEPARTURE_MS;
-      const clientId = await getClientId();
+      const currentCoordinate = toCoordinate(coords);
+      const distanceFromCar = distanceBetweenCoordinatesMeters(currentCoordinate, draftSpotCoordinate);
+      const accuracyBuffer =
+        typeof coords.accuracy === 'number'
+          ? Math.min(coords.accuracy, LOCATION_ACCURACY_BUFFER_METERS)
+          : 0;
+      const allowedDistance = SPOT_VERIFICATION_RADIUS_METERS + accuracyBuffer;
 
       setLocation(coords);
-      setRegion(createRegion(coords));
+
+      if (distanceFromCar > allowedDistance) {
+        Alert.alert(
+          'Verify at the car',
+          `You are about ${formatDistanceMeters(distanceFromCar)} from the car pin. Share it when you are beside the car, or move the pin if it is wrong.`,
+        );
+        return;
+      }
+
+      const verifiedAt = Date.now();
+      const scheduledDepartureTime = verifiedAt + minutes * 60 * 1000;
+      const expiresAt = scheduledDepartureTime + EXPIRE_AFTER_DEPARTURE_MS;
+      const clientId = await getClientId();
+      const verificationPayload = {
+        verified_at: verifiedAt,
+        verification_distance_meters: Math.round(distanceFromCar),
+      };
+
+      if (typeof coords.accuracy === 'number') {
+        verificationPayload.location_accuracy_meters = Math.round(coords.accuracy);
+      }
+
+      setRegion(createRegion(draftSpotCoordinate));
 
       const spotId = await shareSpot({
-        latitude: coords.latitude,
-        longitude: coords.longitude,
+        latitude: draftSpotCoordinate.latitude,
+        longitude: draftSpotCoordinate.longitude,
         scheduled_departure_time: scheduledDepartureTime,
         client_id: clientId,
         car_info: DEFAULT_CAR_INFO,
+        ...verificationPayload,
       });
 
       setSharedSpot({
@@ -471,34 +661,56 @@ function ParkingApp() {
           style={styles.map}
           provider={PROVIDER_DEFAULT}
           region={region}
-          onRegionChangeComplete={setRegion}
+          onPress={
+            intent === 'leave'
+              ? (event) => handleDraftSpotChange(event.nativeEvent.coordinate)
+              : undefined
+          }
+          onRegionChangeComplete={handleRegionChangeComplete}
           showsUserLocation
           showsMyLocationButton={false}
           userInterfaceStyle="dark"
         >
-          {parkingSignals.map((signal) => {
-            const signalStyle = signalTypes[signal.type];
+          {intent === 'find' &&
+            parkingSignals.map((signal) => {
+              const signalStyle = signalTypes[signal.type];
 
-            return (
-              <Marker
-                key={signal.id}
-                coordinate={signal.coordinate}
-                title={signal.title}
-                description={signal.subtitle}
-                onPress={() => setSelectedSignalId(signal.id)}
-              >
-                <View
-                  style={[
-                    styles.signalMarker,
-                    { backgroundColor: signalStyle.color },
-                    focusedSignal?.id === signal.id && styles.signalMarkerSelected,
-                  ]}
+              return (
+                <Marker
+                  key={signal.id}
+                  coordinate={signal.coordinate}
+                  title={signal.title}
+                  description={signal.subtitle}
+                  onPress={() => setSelectedSignalId(signal.id)}
                 >
-                  <Ionicons name={signalStyle.icon} size={20} color={colors.white} />
+                  <View
+                    style={[
+                      styles.signalMarker,
+                      { backgroundColor: signalStyle.color },
+                      focusedSignal?.id === signal.id && styles.signalMarkerSelected,
+                    ]}
+                  >
+                    <Ionicons name={signalStyle.icon} size={20} color={colors.white} />
+                  </View>
+                </Marker>
+              );
+            })}
+          {intent === 'leave' && draftSpotCoordinate && (
+            <Marker
+              coordinate={draftSpotCoordinate}
+              draggable
+              title="Car spot"
+              description="Drag this pin onto the exact parking space."
+              onDragEnd={(event) => handleDraftSpotChange(event.nativeEvent.coordinate)}
+            >
+              <View style={styles.carMarkerWrap}>
+                <View style={styles.carMarker}>
+                  <Ionicons name="car" size={22} color={colors.black} />
                 </View>
-              </Marker>
-            );
-          })}
+                <View style={styles.carMarkerTip} />
+              </View>
+            </Marker>
+          )}
         </MapView>
 
         <View
@@ -521,7 +733,9 @@ function ParkingApp() {
                 ? activeSpots === undefined
                   ? 'Finding parking'
                   : `${parkingSignals.length} fresh spots`
-                : 'Give parking'}
+                : draftSpotCoordinate
+                  ? 'Car pin saved locally'
+                  : 'Tap map for car pin'}
             </Text>
           </View>
           <Pressable style={styles.roundButton} onPress={() => prepareMap(intent)}>
@@ -592,10 +806,34 @@ function ParkingApp() {
                 </View>
               ) : (
                 <>
-                  <Text style={styles.panelTitle}>Leaving soon?</Text>
-                  <Text style={styles.panelCopy}>Pick when your spot opens.</Text>
+                  <Text style={styles.panelTitle}>Mark your parked car</Text>
+                  <Text style={styles.panelCopy}>
+                    {draftSpotCoordinate
+                      ? 'Drag the car pin onto the exact space. We publish only after you verify near the car.'
+                      : 'Tap the map where your car is parked.'}
+                  </Text>
                 </>
               )}
+
+              <View style={styles.pinStatusCard}>
+                <View style={styles.pinStatusIcon}>
+                  <Ionicons
+                    name={draftSpotCoordinate ? 'location' : 'map'}
+                    size={19}
+                    color={colors.black}
+                  />
+                </View>
+                <View style={styles.pinStatusText}>
+                  <Text style={styles.pinStatusTitle}>
+                    {draftSpotCoordinate ? 'Draft pin saved on this phone' : 'No car pin yet'}
+                  </Text>
+                  <Text style={styles.pinStatusCopy}>
+                    {draftSpotCoordinate
+                      ? 'Convex is not updated until verification.'
+                      : 'Tap the map to place it.'}
+                  </Text>
+                </View>
+              </View>
 
               <View style={styles.timeRow}>
                 {departureTimes.map((minutes) => (
@@ -612,22 +850,33 @@ function ParkingApp() {
               </View>
 
               <Pressable
-                style={[styles.primaryButton, isSharingSpot && styles.buttonDisabled]}
+                style={[
+                  styles.primaryButton,
+                  (isSharingSpot || !draftSpotCoordinate) && styles.buttonDisabled,
+                ]}
                 onPress={() => handleDropPin(selectedTime)}
-                disabled={isSharingSpot}
+                disabled={isSharingSpot || !draftSpotCoordinate}
               >
                 {isSharingSpot ? (
                   <ActivityIndicator size="small" color={colors.black} />
                 ) : (
-                  <Ionicons name="radio" size={20} color={colors.black} />
+                  <Ionicons name="checkmark-circle" size={20} color={colors.black} />
                 )}
-                <Text style={styles.primaryButtonText}>{sharedSpotDisplay ? 'Update time' : 'Share my spot'}</Text>
+                <Text style={styles.primaryButtonText}>
+                  {!draftSpotCoordinate
+                    ? 'Place car pin'
+                    : sharedSpotDisplay
+                      ? 'Verify & update'
+                      : 'Verify & share'}
+                </Text>
               </Pressable>
             </View>
           )}
 
           {!panelIsCompact && (
-            <Text style={styles.tinyNote}>{intent === 'leave' ? 'Shared spots disappear on their own.' : 'Simple. Fresh. Nearby.'}</Text>
+            <Text style={styles.tinyNote}>
+              {intent === 'leave' ? 'No live tracking. One verified publish.' : 'Simple. Fresh. Nearby.'}
+            </Text>
           )}
         </View>
       </View>
@@ -913,6 +1162,31 @@ const styles = StyleSheet.create({
     borderColor: colors.black,
     boxShadow: '0 8px 18px rgba(0, 0, 0, 0.32)',
   },
+  carMarkerWrap: {
+    alignItems: 'center',
+  },
+  carMarker: {
+    width: 52,
+    height: 52,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 20,
+    backgroundColor: colors.green,
+    borderWidth: 4,
+    borderColor: colors.black,
+    boxShadow: '0 8px 18px rgba(0, 0, 0, 0.32)',
+  },
+  carMarkerTip: {
+    width: 12,
+    height: 12,
+    marginTop: -8,
+    borderRightWidth: 4,
+    borderBottomWidth: 4,
+    borderRightColor: colors.black,
+    borderBottomColor: colors.black,
+    backgroundColor: colors.green,
+    transform: [{ rotate: '45deg' }],
+  },
   commandPanel: {
     position: 'absolute',
     bottom: 0,
@@ -966,6 +1240,40 @@ const styles = StyleSheet.create({
   liveText: {
     flex: 1,
     gap: 2,
+  },
+  pinStatusCard: {
+    minHeight: 66,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    padding: 12,
+    borderRadius: 20,
+    backgroundColor: colors.panelSoft,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  pinStatusIcon: {
+    width: 42,
+    height: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 16,
+    backgroundColor: colors.green,
+  },
+  pinStatusText: {
+    flex: 1,
+    gap: 2,
+  },
+  pinStatusTitle: {
+    color: colors.white,
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  pinStatusCopy: {
+    color: colors.muted,
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: '700',
   },
   cancelButton: {
     width: 40,

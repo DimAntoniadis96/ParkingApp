@@ -3,6 +3,6 @@ import { internal } from "./_generated/api";
 
 const crons = cronJobs();
 
-crons.interval("maintain parking spots", { minutes: 1 }, internal.parking.maintainParkingSpots);
+crons.interval("maintain parking spots", { minutes: 5 }, internal.parking.maintainParkingSpots);
 
 export default crons;

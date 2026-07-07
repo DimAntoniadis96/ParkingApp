@@ -1,0 +1,30 @@
+{
+  "cli": {
+    "version": ">= 16.0.1",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_CONVEX_URL": "https://grand-lark-588.eu-west-1.convex.cloud",
+        "EXPO_PUBLIC_CONVEX_SITE_URL": "https://grand-lark-588.eu-west-1.convex.site"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_CONVEX_URL": "https://pastel-ladybug-488.convex.cloud",
+        "EXPO_PUBLIC_CONVEX_SITE_URL": "https://pastel-ladybug-488.convex.site"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_CONVEX_URL": "https://pastel-ladybug-488.convex.cloud",
+        "EXPO_PUBLIC_CONVEX_SITE_URL": "https://pastel-ladybug-488.convex.site"
+      }
+    }
+  }
+}
