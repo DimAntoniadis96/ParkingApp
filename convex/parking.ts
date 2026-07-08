@@ -6,18 +6,20 @@ const CELL_SIZE_DEGREES = 0.01;
 const ACTIVE_QUERY_LIMIT = 60;
 const PER_AREA_LIMIT = 12;
 const EXPIRE_AFTER_DEPARTURE_MS = 12 * 60 * 1000;
-const ORANGE_AFTER_DEPARTURE_MS = 5 * 60 * 1000;
+const OPEN_CONFIRMED_TTL_MS = 3 * 60 * 1000;
 const MAINTENANCE_BATCH_SIZE = 100;
 const CLIENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_SCHEDULE_AHEAD_MS = 15 * 60 * 1000;
-const MAX_VERIFICATION_AGE_MS = 2 * 60 * 1000;
 const MAX_VERIFICATION_FUTURE_MS = 30 * 1000;
-const MAX_VERIFICATION_DISTANCE_METERS = 120;
 const MAX_LOCATION_ACCURACY_METERS = 200;
 const SHARE_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
 const SHARE_RATE_LIMIT_COUNT = 4;
 const CANCEL_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
 const CANCEL_RATE_LIMIT_COUNT = 10;
+const FEEDBACK_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+const FEEDBACK_RATE_LIMIT_COUNT = 20;
+const FEEDBACK_REPEAT_WINDOW_MS = 30 * 60 * 1000;
+const MAX_FEEDBACK_DISTANCE_METERS = 1000;
 const CLIENT_ID_PATTERN = /^[a-f0-9]{32}$/;
 const PRIVATE_CAR_INFO = {
   brand: "Private vehicle",
@@ -26,12 +28,35 @@ const PRIVATE_CAR_INFO = {
 };
 
 type ParkingSpot = Doc<"parking_spots">;
-type ClientRequestKind = "share" | "cancel";
+type ParkingClient = Doc<"parking_clients">;
+type ClientRequestKind = "share" | "cancel" | "feedback";
+type ClientRateLimitWindowField = keyof Pick<
+  ParkingClient,
+  "share_window_started_at" | "cancel_window_started_at" | "feedback_window_started_at"
+>;
+type ClientRateLimitCountField = keyof Pick<
+  ParkingClient,
+  "share_count" | "cancel_count" | "feedback_count"
+>;
+type ClientRateLimitLastField = keyof Pick<
+  ParkingClient,
+  "last_share_at" | "last_cancel_at" | "last_feedback_at"
+>;
+type ClientRateLimitConfig = {
+  windowMs: number;
+  requestLimit: number;
+  windowField: ClientRateLimitWindowField;
+  countField: ClientRateLimitCountField;
+  lastRequestField: ClientRateLimitLastField;
+};
 
 const parkingSpotArgs = {
   latitude: v.number(),
   longitude: v.number(),
   scheduled_departure_time: v.number(),
+  departure_window_label: v.optional(v.string()),
+  departure_window_min_minutes: v.optional(v.number()),
+  departure_window_max_minutes: v.optional(v.number()),
   verified_at: v.optional(v.number()),
   verification_distance_meters: v.optional(v.number()),
   location_accuracy_meters: v.optional(v.number()),
@@ -42,6 +67,12 @@ const parkingSpotArgs = {
     plate_slug: v.string(),
   }),
 };
+
+const navigationFeedbackOutcome = v.union(
+  v.literal("parked"),
+  v.literal("found_not_taken"),
+  v.literal("not_found"),
+);
 
 function areaKey(latitude: number, longitude: number) {
   const latCell = Math.floor(latitude / CELL_SIZE_DEGREES);
@@ -79,6 +110,9 @@ function assertValidShareRequest(
     latitude: number;
     longitude: number;
     scheduled_departure_time: number;
+    departure_window_label?: string;
+    departure_window_min_minutes?: number;
+    departure_window_max_minutes?: number;
     verified_at?: number;
     verification_distance_meters?: number;
     location_accuracy_meters?: number;
@@ -97,21 +131,50 @@ function assertValidShareRequest(
   }
 
   if (
-    typeof args.verified_at !== "number" ||
-    !Number.isFinite(args.verified_at) ||
-    now - args.verified_at > MAX_VERIFICATION_AGE_MS ||
-    args.verified_at - now > MAX_VERIFICATION_FUTURE_MS
+    typeof args.departure_window_label === "string" &&
+    (args.departure_window_label.length < 3 || args.departure_window_label.length > 16)
   ) {
-    throw new Error("Spot verification expired.");
+    throw new Error("Invalid departure window.");
   }
 
   if (
-    typeof args.verification_distance_meters !== "number" ||
-    !Number.isFinite(args.verification_distance_meters) ||
-    args.verification_distance_meters < 0 ||
-    args.verification_distance_meters > MAX_VERIFICATION_DISTANCE_METERS
+    typeof args.departure_window_min_minutes === "number" &&
+    (!Number.isFinite(args.departure_window_min_minutes) ||
+      args.departure_window_min_minutes < 1 ||
+      args.departure_window_min_minutes > 15)
   ) {
-    throw new Error("Spot must be verified near the car.");
+    throw new Error("Invalid departure window.");
+  }
+
+  if (
+    typeof args.departure_window_max_minutes === "number" &&
+    (!Number.isFinite(args.departure_window_max_minutes) ||
+      args.departure_window_max_minutes < 1 ||
+      args.departure_window_max_minutes > 15)
+  ) {
+    throw new Error("Invalid departure window.");
+  }
+
+  if (
+    typeof args.departure_window_min_minutes === "number" &&
+    typeof args.departure_window_max_minutes === "number" &&
+    args.departure_window_min_minutes > args.departure_window_max_minutes
+  ) {
+    throw new Error("Invalid departure window.");
+  }
+
+  if (
+    typeof args.verified_at === "number" &&
+    (!Number.isFinite(args.verified_at) || args.verified_at - now > MAX_VERIFICATION_FUTURE_MS)
+  ) {
+    throw new Error("Invalid pin confirmation.");
+  }
+
+  if (
+    typeof args.verification_distance_meters === "number" &&
+    (!Number.isFinite(args.verification_distance_meters) || args.verification_distance_meters < 0)
+  ) {
+    throw new Error("Invalid pin confirmation.");
   }
 
   if (
@@ -146,26 +209,32 @@ function nearbyAreaKeys(latitude: number, longitude: number) {
   return keys;
 }
 
-function statusForTime(now: number, scheduledDepartureTime: number) {
-  if (now < scheduledDepartureTime) {
-    return "green";
-  }
-
-  if (now < scheduledDepartureTime + ORANGE_AFTER_DEPARTURE_MS) {
-    return "orange";
-  }
-
-  return "red";
-}
-
 function toPublicSpot(spot: ParkingSpot, now: number) {
+  const isVerifiedOpen = typeof spot.open_confirmed_at === "number";
+
   return {
     _id: spot._id,
     latitude: spot.latitude,
     longitude: spot.longitude,
-    status: statusForTime(now, spot.scheduled_departure_time),
+    status: isVerifiedOpen ? "green" : "orange",
+    availability_status: isVerifiedOpen ? "verified_open" : "opening_soon",
     scheduled_departure_time: spot.scheduled_departure_time,
+    departure_window_label: spot.departure_window_label ?? null,
+    departure_window_min_minutes: spot.departure_window_min_minutes ?? null,
+    departure_window_max_minutes: spot.departure_window_max_minutes ?? null,
+    open_confirmed_at: spot.open_confirmed_at ?? null,
   };
+}
+
+function sortPublicSpots(left: ParkingSpot, right: ParkingSpot) {
+  const leftPriority = typeof left.open_confirmed_at === "number" ? 0 : 1;
+  const rightPriority = typeof right.open_confirmed_at === "number" ? 0 : 1;
+
+  if (leftPriority !== rightPriority) {
+    return leftPriority - rightPriority;
+  }
+
+  return left.scheduled_departure_time - right.scheduled_departure_time;
 }
 
 async function enforceClientRateLimit(
@@ -179,11 +248,31 @@ async function enforceClientRateLimit(
     .withIndex("by_client_id", (q) => q.eq("client_id", clientId))
     .unique();
 
-  const windowMs = kind === "share" ? SHARE_RATE_LIMIT_WINDOW_MS : CANCEL_RATE_LIMIT_WINDOW_MS;
-  const requestLimit = kind === "share" ? SHARE_RATE_LIMIT_COUNT : CANCEL_RATE_LIMIT_COUNT;
-  const windowField = kind === "share" ? "share_window_started_at" : "cancel_window_started_at";
-  const countField = kind === "share" ? "share_count" : "cancel_count";
-  const lastRequestField = kind === "share" ? "last_share_at" : "last_cancel_at";
+  const rateLimitConfig: ClientRateLimitConfig =
+    kind === "share"
+      ? {
+          windowMs: SHARE_RATE_LIMIT_WINDOW_MS,
+          requestLimit: SHARE_RATE_LIMIT_COUNT,
+          windowField: "share_window_started_at",
+          countField: "share_count",
+          lastRequestField: "last_share_at",
+        }
+      : kind === "cancel"
+        ? {
+            windowMs: CANCEL_RATE_LIMIT_WINDOW_MS,
+            requestLimit: CANCEL_RATE_LIMIT_COUNT,
+            windowField: "cancel_window_started_at",
+            countField: "cancel_count",
+            lastRequestField: "last_cancel_at",
+          }
+        : {
+            windowMs: FEEDBACK_RATE_LIMIT_WINDOW_MS,
+            requestLimit: FEEDBACK_RATE_LIMIT_COUNT,
+            windowField: "feedback_window_started_at",
+            countField: "feedback_count",
+            lastRequestField: "last_feedback_at",
+          };
+  const { windowMs, requestLimit, windowField, countField, lastRequestField } = rateLimitConfig;
   const windowStartedAt = existingClient?.[windowField];
   const currentCount = existingClient?.[countField] ?? 0;
   const isSameWindow = typeof windowStartedAt === "number" && now - windowStartedAt < windowMs;
@@ -262,21 +351,40 @@ export const shareSpot = mutation({
     const verifiedAt = args.verified_at;
     const verificationDistanceMeters = args.verification_distance_meters;
 
-    if (typeof verifiedAt !== "number" || typeof verificationDistanceMeters !== "number") {
-      throw new Error("Spot verification is required.");
+    const verificationFields: {
+      verified_at?: number;
+      verification_distance_meters?: number;
+      location_accuracy_meters?: number;
+    } = {};
+
+    if (typeof verifiedAt === "number") {
+      verificationFields.verified_at = verifiedAt;
     }
 
-    const verificationFields: {
-      verified_at: number;
-      verification_distance_meters: number;
-      location_accuracy_meters?: number;
-    } = {
-      verified_at: verifiedAt,
-      verification_distance_meters: Math.round(verificationDistanceMeters),
-    };
+    if (typeof verificationDistanceMeters === "number") {
+      verificationFields.verification_distance_meters = Math.round(verificationDistanceMeters);
+    }
 
     if (typeof args.location_accuracy_meters === "number") {
       verificationFields.location_accuracy_meters = Math.round(args.location_accuracy_meters);
+    }
+
+    const departureWindowFields: {
+      departure_window_label?: string;
+      departure_window_min_minutes?: number;
+      departure_window_max_minutes?: number;
+    } = {};
+
+    if (typeof args.departure_window_label === "string") {
+      departureWindowFields.departure_window_label = args.departure_window_label;
+    }
+
+    if (typeof args.departure_window_min_minutes === "number") {
+      departureWindowFields.departure_window_min_minutes = Math.round(args.departure_window_min_minutes);
+    }
+
+    if (typeof args.departure_window_max_minutes === "number") {
+      departureWindowFields.departure_window_max_minutes = Math.round(args.departure_window_max_minutes);
     }
 
     await enforceClientRateLimit(ctx, args.client_id, now, "share");
@@ -298,13 +406,14 @@ export const shareSpot = mutation({
 
     await Promise.all(existingClientSpots.map((spot) => ctx.db.delete(spot._id)));
 
-    return await ctx.db.insert("parking_spots", {
+    const spotId = await ctx.db.insert("parking_spots", {
       latitude: args.latitude,
       longitude: args.longitude,
       client_id: args.client_id,
       car_info: PRIVATE_CAR_INFO,
       ...verificationFields,
-      status: statusForTime(now, scheduledDepartureTime),
+      ...departureWindowFields,
+      status: "orange",
       scheduled_departure_time: scheduledDepartureTime,
       expires_at: expiresAt,
       created_at: now,
@@ -312,6 +421,14 @@ export const shareSpot = mutation({
       area_key: areaKey(args.latitude, args.longitude),
       spot_key: nextSpotKey,
     });
+
+    return {
+      spotId,
+      scheduledDepartureTime,
+      departureWindowLabel: args.departure_window_label ?? null,
+      expiresAt,
+      openConfirmedAt: null,
+    };
   },
 });
 
@@ -344,7 +461,7 @@ export const getActiveSpots = query({
 
     return results
       .flat()
-      .sort((left, right) => left.scheduled_departure_time - right.scheduled_departure_time)
+      .sort(sortPublicSpots)
       .slice(0, limit)
       .map((spot) => toPublicSpot(spot, now));
   },
@@ -374,9 +491,116 @@ export const getNearbyActiveSpots = query({
 
     return results
       .flat()
-      .sort((left, right) => left.scheduled_departure_time - right.scheduled_departure_time)
+      .sort(sortPublicSpots)
       .slice(0, limit)
       .map((spot) => toPublicSpot(spot, now));
+  },
+});
+
+export const recordNavigationFeedback = mutation({
+  args: {
+    client_id: v.string(),
+    spot_id: v.id("parking_spots"),
+    outcome: navigationFeedbackOutcome,
+    distance_meters: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    assertValidClientId(args.client_id);
+
+    if (
+      typeof args.distance_meters === "number" &&
+      (!Number.isFinite(args.distance_meters) ||
+        args.distance_meters < 0 ||
+        args.distance_meters > MAX_FEEDBACK_DISTANCE_METERS)
+    ) {
+      throw new Error("Invalid arrival feedback.");
+    }
+
+    await enforceClientRateLimit(ctx, args.client_id, now, "feedback");
+
+    const feedbackKey = `${args.client_id}:${args.spot_id}`;
+    const distanceFields: { distance_meters?: number } = {};
+
+    if (typeof args.distance_meters === "number") {
+      distanceFields.distance_meters = Math.round(args.distance_meters);
+    }
+
+    const existingFeedback = (
+      await ctx.db
+        .query("parking_navigation_feedback")
+        .withIndex("by_feedback_key", (q) => q.eq("feedback_key", feedbackKey))
+        .order("desc")
+        .take(1)
+    )[0];
+
+    if (existingFeedback && now - existingFeedback.created_at < FEEDBACK_REPEAT_WINDOW_MS) {
+      await ctx.db.patch(existingFeedback._id, {
+        outcome: args.outcome,
+        updated_at: now,
+        ...distanceFields,
+      });
+
+      return {
+        feedbackId: existingFeedback._id,
+        updated: true,
+      };
+    }
+
+    const feedbackId = await ctx.db.insert("parking_navigation_feedback", {
+      client_id: args.client_id,
+      spot_id: args.spot_id,
+      outcome: args.outcome,
+      feedback_key: feedbackKey,
+      created_at: now,
+      ...distanceFields,
+    });
+
+    return {
+      feedbackId,
+      updated: false,
+    };
+  },
+});
+
+export const confirmMySpotLeft = mutation({
+  args: {
+    client_id: v.string(),
+    spot_id: v.optional(v.id("parking_spots")),
+  },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    assertValidClientId(args.client_id);
+
+    const spot =
+      typeof args.spot_id === "string"
+        ? await ctx.db.get(args.spot_id)
+        : (
+            await ctx.db
+              .query("parking_spots")
+              .withIndex("by_client_expires_at", (q) => q.eq("client_id", args.client_id).gt("expires_at", now))
+              .order("asc")
+              .take(1)
+          )[0];
+
+    if (!spot || spot.client_id !== args.client_id || typeof spot.expires_at !== "number" || spot.expires_at <= now) {
+      throw new Error("No active parking share found.");
+    }
+
+    const expiresAt = now + OPEN_CONFIRMED_TTL_MS;
+
+    await ctx.db.patch(spot._id, {
+      open_confirmed_at: now,
+      expires_at: expiresAt,
+      updated_at: now,
+      status: "green",
+    });
+
+    return {
+      spotId: spot._id,
+      openConfirmedAt: now,
+      expiresAt,
+    };
   },
 });
 

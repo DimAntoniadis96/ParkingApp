@@ -7,6 +7,10 @@ export default defineSchema({
     longitude: v.number(),
     status: v.union(v.literal("green"), v.literal("orange"), v.literal("red")),
     scheduled_departure_time: v.number(),
+    departure_window_label: v.optional(v.string()),
+    departure_window_min_minutes: v.optional(v.number()),
+    departure_window_max_minutes: v.optional(v.number()),
+    open_confirmed_at: v.optional(v.number()),
     expires_at: v.optional(v.number()),
     created_at: v.optional(v.number()),
     updated_at: v.optional(v.number()),
@@ -36,7 +40,26 @@ export default defineSchema({
     last_cancel_at: v.optional(v.number()),
     cancel_window_started_at: v.optional(v.number()),
     cancel_count: v.optional(v.number()),
+    last_feedback_at: v.optional(v.number()),
+    feedback_window_started_at: v.optional(v.number()),
+    feedback_count: v.optional(v.number()),
   })
     .index("by_client_id", ["client_id"])
     .index("by_updated_at", ["updated_at"]),
+  parking_navigation_feedback: defineTable({
+    client_id: v.string(),
+    spot_id: v.id("parking_spots"),
+    outcome: v.union(
+      v.literal("parked"),
+      v.literal("found_not_taken"),
+      v.literal("not_found"),
+    ),
+    feedback_key: v.string(),
+    distance_meters: v.optional(v.number()),
+    created_at: v.number(),
+    updated_at: v.optional(v.number()),
+  })
+    .index("by_feedback_key", ["feedback_key"])
+    .index("by_spot_id_and_created_at", ["spot_id", "created_at"])
+    .index("by_client_id_and_created_at", ["client_id", "created_at"]),
 });
