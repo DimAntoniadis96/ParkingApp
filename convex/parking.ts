@@ -1,4 +1,4 @@
-import { internalMutation, mutation, MutationCtx, query } from "./_generated/server";
+import { internalMutation, mutation, MutationCtx, query, QueryCtx } from "./_generated/server";
 import { Doc } from "./_generated/dataModel";
 import { v } from "convex/values";
 
@@ -8,6 +8,7 @@ const PER_AREA_LIMIT = 12;
 const EXPIRE_AFTER_DEPARTURE_MS = 12 * 60 * 1000;
 const OPEN_CONFIRMED_TTL_MS = 3 * 60 * 1000;
 const MAINTENANCE_BATCH_SIZE = 100;
+const MAINTENANCE_MAX_BATCHES = 10;
 const CLIENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_SCHEDULE_AHEAD_MS = 15 * 60 * 1000;
 const MAX_VERIFICATION_FUTURE_MS = 30 * 1000;
@@ -339,6 +340,39 @@ async function deleteLegacyBatch(ctx: MutationCtx, batchSize = MAINTENANCE_BATCH
   return legacySpots.length;
 }
 
+// Drain expired spots across several bounded batches so a single (infrequent)
+// cron run fully clears the backlog instead of leaving leftovers for the next
+// run. Capped by MAINTENANCE_MAX_BATCHES to keep the transaction size bounded.
+async function drainExpiredSpots(ctx: MutationCtx, now: number) {
+  let totalDeleted = 0;
+
+  for (let iteration = 0; iteration < MAINTENANCE_MAX_BATCHES; iteration += 1) {
+    const deleted = await deleteExpiredBatch(ctx, now);
+    totalDeleted += deleted;
+
+    if (deleted < MAINTENANCE_BATCH_SIZE) {
+      break;
+    }
+  }
+
+  return totalDeleted;
+}
+
+async function drainStaleClients(ctx: MutationCtx, now: number) {
+  let totalDeleted = 0;
+
+  for (let iteration = 0; iteration < MAINTENANCE_MAX_BATCHES; iteration += 1) {
+    const deleted = await deleteStaleClientsBatch(ctx, now);
+    totalDeleted += deleted;
+
+    if (deleted < MAINTENANCE_BATCH_SIZE) {
+      break;
+    }
+  }
+
+  return totalDeleted;
+}
+
 export const shareSpot = mutation({
   args: parkingSpotArgs,
   handler: async (ctx, args) => {
@@ -432,6 +466,34 @@ export const shareSpot = mutation({
   },
 });
 
+async function queryNearbyActiveSpots(
+  ctx: QueryCtx,
+  latitude: number,
+  longitude: number,
+  limit: number | undefined,
+) {
+  const now = Date.now();
+  assertValidCoordinate(latitude, longitude);
+
+  const boundedActiveLimit = boundedLimit(limit);
+  const areaKeys = nearbyAreaKeys(latitude, longitude);
+  const results = await Promise.all(
+    areaKeys.map((key) =>
+      ctx.db
+        .query("parking_spots")
+        .withIndex("by_area_expires_at", (q) => q.eq("area_key", key).gt("expires_at", now))
+        .order("asc")
+        .take(PER_AREA_LIMIT),
+    ),
+  );
+
+  return results
+    .flat()
+    .sort(sortPublicSpots)
+    .slice(0, boundedActiveLimit)
+    .map((spot) => toPublicSpot(spot, now));
+}
+
 export const getActiveSpots = query({
   args: {
     latitude: v.optional(v.number()),
@@ -439,31 +501,11 @@ export const getActiveSpots = query({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const now = Date.now();
-    const limit = boundedLimit(args.limit);
-
     if (typeof args.latitude !== "number" || typeof args.longitude !== "number") {
       return [];
     }
 
-    assertValidCoordinate(args.latitude, args.longitude);
-
-    const areaKeys = nearbyAreaKeys(args.latitude, args.longitude);
-    const results = await Promise.all(
-      areaKeys.map((key) =>
-        ctx.db
-          .query("parking_spots")
-          .withIndex("by_area_expires_at", (q) => q.eq("area_key", key).gt("expires_at", now))
-          .order("asc")
-          .take(PER_AREA_LIMIT),
-      ),
-    );
-
-    return results
-      .flat()
-      .sort(sortPublicSpots)
-      .slice(0, limit)
-      .map((spot) => toPublicSpot(spot, now));
+    return queryNearbyActiveSpots(ctx, args.latitude, args.longitude, args.limit);
   },
 });
 
@@ -473,28 +515,8 @@ export const getNearbyActiveSpots = query({
     longitude: v.number(),
     limit: v.optional(v.number()),
   },
-  handler: async (ctx, args) => {
-    const now = Date.now();
-    assertValidCoordinate(args.latitude, args.longitude);
-
-    const limit = boundedLimit(args.limit);
-    const areaKeys = nearbyAreaKeys(args.latitude, args.longitude);
-    const results = await Promise.all(
-      areaKeys.map((key) =>
-        ctx.db
-          .query("parking_spots")
-          .withIndex("by_area_expires_at", (q) => q.eq("area_key", key).gt("expires_at", now))
-          .order("asc")
-          .take(PER_AREA_LIMIT),
-      ),
-    );
-
-    return results
-      .flat()
-      .sort(sortPublicSpots)
-      .slice(0, limit)
-      .map((spot) => toPublicSpot(spot, now));
-  },
+  handler: async (ctx, args) =>
+    queryNearbyActiveSpots(ctx, args.latitude, args.longitude, args.limit),
 });
 
 export const recordNavigationFeedback = mutation({
@@ -533,6 +555,18 @@ export const recordNavigationFeedback = mutation({
         .order("desc")
         .take(1)
     )[0];
+
+    // Only remove the shared spot when the driver actually parked there (the
+    // space is now taken). "found_not_taken" means the spot is still available,
+    // and "not_found" is a single unverified report — deleting on either would
+    // wrongly remove a still-valid spot for every other driver. Those spots are
+    // left to expire naturally.
+    if (args.outcome === "parked") {
+      const spot = await ctx.db.get(args.spot_id);
+      if (spot) {
+        await ctx.db.delete(spot._id);
+      }
+    }
 
     if (existingFeedback && now - existingFeedback.created_at < FEEDBACK_REPEAT_WINDOW_MS) {
       await ctx.db.patch(existingFeedback._id, {
@@ -628,10 +662,21 @@ export const maintainParkingSpots = internalMutation({
   args: {},
   handler: async (ctx) => {
     const now = Date.now();
-    const legacy = await deleteLegacyBatch(ctx);
-    const deleted = await deleteExpiredBatch(ctx, now);
-    const staleClients = await deleteStaleClientsBatch(ctx, now);
+    const deleted = await drainExpiredSpots(ctx, now);
+    const staleClients = await drainStaleClients(ctx, now);
 
-    return { deleted, legacy, staleClients };
+    return { deleted, staleClients };
+  },
+});
+
+// Legacy spots (missing expires_at/area_key/client_id) are a one-time migration
+// concern. Running this scan on the hot maintenance path wasted reads on every
+// cron tick, so it now runs on its own low-frequency schedule.
+export const cleanupLegacySpots = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const legacy = await deleteLegacyBatch(ctx);
+
+    return { legacy };
   },
 });
