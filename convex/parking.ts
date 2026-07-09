@@ -219,11 +219,16 @@ function toPublicSpot(spot: ParkingSpot, now: number) {
     longitude: spot.longitude,
     status: isVerifiedOpen ? "green" : "orange",
     availability_status: isVerifiedOpen ? "verified_open" : "opening_soon",
+    is_verified_open: isVerifiedOpen,
     scheduled_departure_time: spot.scheduled_departure_time,
     departure_window_label: spot.departure_window_label ?? null,
     departure_window_min_minutes: spot.departure_window_min_minutes ?? null,
     departure_window_max_minutes: spot.departure_window_max_minutes ?? null,
     open_confirmed_at: spot.open_confirmed_at ?? null,
+    // Freshness/trust fields so the client can show spot age, a confirmation
+    // recency signal, and a live countdown to expiry.
+    created_at: spot.created_at ?? spot._creationTime,
+    expires_at: spot.expires_at ?? null,
   };
 }
 
@@ -556,12 +561,14 @@ export const recordNavigationFeedback = mutation({
         .take(1)
     )[0];
 
-    // Only remove the shared spot when the driver actually parked there (the
-    // space is now taken). "found_not_taken" means the spot is still available,
-    // and "not_found" is a single unverified report — deleting on either would
-    // wrongly remove a still-valid spot for every other driver. Those spots are
-    // left to expire naturally.
-    if (args.outcome === "parked") {
+    // Retire the shared spot unless it is confirmed to still be open:
+    //   - "parked"          -> the space is now taken, remove it.
+    //   - "not_found"       -> the driver reached the location and there was no
+    //                          open parking (stale / already gone), so remove it
+    //                          instead of sending the next driver to a dead end.
+    //   - "found_not_taken" -> the space is real and still open, so KEEP it so
+    //                          other drivers can still take it.
+    if (args.outcome === "parked" || args.outcome === "not_found") {
       const spot = await ctx.db.get(args.spot_id);
       if (spot) {
         await ctx.db.delete(spot._id);
@@ -655,6 +662,46 @@ export const cancelMyActiveSpot = mutation({
     await Promise.all(activeSpots.map((spot) => ctx.db.delete(spot._id)));
 
     return activeSpots.length;
+  },
+});
+
+// Lets a client restore its own active share after an app restart. Returns the
+// owner's full spot (including coordinate) since it is their own data. Reads a
+// single indexed document, so it is cheap to call on launch.
+export const getMyActiveSpot = query({
+  args: {
+    client_id: v.string(),
+  },
+  handler: async (ctx, args) => {
+    if (!CLIENT_ID_PATTERN.test(args.client_id)) {
+      return null;
+    }
+
+    const now = Date.now();
+    const spot = (
+      await ctx.db
+        .query("parking_spots")
+        .withIndex("by_client_expires_at", (q) =>
+          q.eq("client_id", args.client_id).gt("expires_at", now),
+        )
+        .order("asc")
+        .take(1)
+    )[0];
+
+    if (!spot) {
+      return null;
+    }
+
+    return {
+      _id: spot._id,
+      latitude: spot.latitude,
+      longitude: spot.longitude,
+      scheduled_departure_time: spot.scheduled_departure_time,
+      departure_window_label: spot.departure_window_label ?? null,
+      open_confirmed_at: spot.open_confirmed_at ?? null,
+      expires_at: spot.expires_at ?? null,
+      created_at: spot.created_at ?? spot._creationTime,
+    };
   },
 });
 

@@ -15,7 +15,7 @@ import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { ConvexProvider, ConvexReactClient, useMutation, useQuery } from 'convex/react';
+import { ConvexProvider, ConvexReactClient, useConvex, useMutation, useQuery } from 'convex/react';
 import MapView, { Marker, Polyline, PROVIDER_DEFAULT } from 'react-native-maps';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { api } from './convex/_generated/api';
@@ -24,18 +24,27 @@ const park2MeLogo = require('./park2me_logo.png');
 const park2MeSmallLogo = require('./assets/park2me-small-logo-horizontal.png');
 
 const colors = {
-  black: '#050706',
-  panel: '#0d120f',
-  panelSoft: '#151c18',
-  panelRaised: '#1b241f',
-  green: '#22c55e',
-  greenSoft: '#173d25',
-  orange: '#f59e0b',
-  red: '#ef4444',
-  white: '#f8fafc',
-  muted: '#95a39b',
-  dim: '#56635d',
-  border: '#243029',
+  // Premium glass dark palette. Panels are translucent so the live map glows
+  // through them; borders are hairline white for that frosted-glass edge.
+  black: '#04070d',
+  night: '#070b12',
+  panel: 'rgba(15, 21, 30, 0.86)',
+  panelSoft: 'rgba(255, 255, 255, 0.055)',
+  panelRaised: 'rgba(255, 255, 255, 0.10)',
+  green: '#2fd06e',
+  greenDeep: '#16a34a',
+  greenSoft: 'rgba(47, 208, 110, 0.16)',
+  greenGlow: 'rgba(47, 208, 110, 0.30)',
+  orange: '#f7ad2b',
+  orangeSoft: 'rgba(247, 173, 43, 0.16)',
+  red: '#f2555a',
+  redSoft: 'rgba(242, 85, 90, 0.16)',
+  white: '#f2f6fc',
+  muted: '#9aa8b6',
+  dim: '#5a6672',
+  border: 'rgba(255, 255, 255, 0.10)',
+  borderStrong: 'rgba(255, 255, 255, 0.17)',
+  hairline: 'rgba(255, 255, 255, 0.06)',
 };
 
 const signalTypes = {
@@ -76,6 +85,8 @@ const DRAFT_SPOT_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const NAVIGATION_ARRIVAL_RADIUS_METERS = 25;
 const NAVIGATION_UPDATE_DISTANCE_METERS = 5;
 const NAVIGATION_UPDATE_INTERVAL_MS = 2500;
+const LOCATION_WATCH_DISTANCE_METERS = 8;
+const LOCATION_WATCH_INTERVAL_MS = 4000;
 const NAVIGATION_REGION_MIN_DELTA = 0.004;
 const NAVIGATION_REGION_PADDING = 1.8;
 const CITY_DRIVING_METERS_PER_SECOND = 5;
@@ -218,17 +229,38 @@ function formatEstimatedEta(distance) {
   return formatMinutes((distance / CITY_DRIVING_METERS_PER_SECOND) * 1000);
 }
 
-function formatDistanceFromRegion(spot, region) {
+function distanceFromRegionMeters(spot, region) {
   if (!region) {
-    return 'nearby';
+    return null;
   }
 
   const latitudeMeters = (spot.latitude - region.latitude) * 111000;
   const longitudeMeters =
     (spot.longitude - region.longitude) * 111000 * Math.cos((region.latitude * Math.PI) / 180);
-  const distance = Math.round(Math.sqrt(latitudeMeters ** 2 + longitudeMeters ** 2));
 
-  return distance < 1000 ? `${distance} m` : `${(distance / 1000).toFixed(1)} km`;
+  return Math.sqrt(latitudeMeters ** 2 + longitudeMeters ** 2);
+}
+
+function formatAgo(timestamp, now) {
+  if (typeof timestamp !== 'number') {
+    return null;
+  }
+
+  const seconds = Math.max(0, Math.round((now - timestamp) / 1000));
+
+  if (seconds < 45) {
+    return 'just now';
+  }
+
+  const minutes = Math.round(seconds / 60);
+
+  if (minutes < 60) {
+    return `${minutes} min ago`;
+  }
+
+  const hours = Math.round(minutes / 60);
+
+  return hours === 1 ? '1 hr ago' : `${hours} hr ago`;
 }
 
 function formatSpotTime(scheduledDepartureTime, now) {
@@ -277,7 +309,17 @@ function getSharedSpotDisplay(sharedSpot, now) {
 function mapConvexSpotToSignal(spot, region, now) {
   const isVerifiedOpen = spot.availability_status === 'verified_open';
   const isAwaitingConfirmation = !isVerifiedOpen && now >= spot.scheduled_departure_time;
-  const distance = formatDistanceFromRegion(spot, region);
+  const distanceMeters = distanceFromRegionMeters(spot, region);
+  const distanceLabel = distanceMeters === null ? 'nearby' : formatDistanceMeters(distanceMeters);
+  const etaLabel = distanceMeters === null ? '—' : formatEstimatedEta(distanceMeters);
+  const confirmedAgo = formatAgo(spot.open_confirmed_at, now);
+  const sharedAgo = formatAgo(spot.created_at, now);
+
+  const freshnessLabel = isVerifiedOpen
+    ? `Confirmed ${confirmedAgo ?? 'open'}`
+    : isAwaitingConfirmation
+      ? `Awaiting confirmation • ${sharedAgo ?? 'just now'}`
+      : `${formatSpotTime(spot.scheduled_departure_time, now)} • ${sharedAgo ?? 'just now'}`;
 
   return {
     id: spot._id,
@@ -288,10 +330,10 @@ function mapConvexSpotToSignal(spot, region, now) {
         ? 'Awaiting confirmation'
         : 'Parking opening',
     subtitle: isVerifiedOpen
-      ? `Verified open now • ${distance}`
+      ? `Verified open now • ${distanceLabel}`
       : isAwaitingConfirmation
-        ? `Not verified yet • driver confirmation pending • ${distance}`
-        : `Not verified yet • opens by ${formatClockTime(spot.scheduled_departure_time)} • ${distance}`,
+        ? `Not verified yet • driver confirmation pending • ${distanceLabel}`
+        : `Not verified yet • opens by ${formatClockTime(spot.scheduled_departure_time)} • ${distanceLabel}`,
     detail: isVerifiedOpen
       ? 'This driver confirmed they left.'
       : isAwaitingConfirmation
@@ -300,6 +342,10 @@ function mapConvexSpotToSignal(spot, region, now) {
     isVerifiedOpen,
     opensAt: spot.scheduled_departure_time,
     departureWindowLabel: spot.departure_window_label,
+    distanceMeters,
+    distanceLabel,
+    etaLabel,
+    freshnessLabel,
     coordinate: {
       latitude: spot.latitude,
       longitude: spot.longitude,
@@ -397,6 +443,8 @@ function ParkingApp() {
   const [navigationError, setNavigationError] = useState('');
   const [leaveFlowStep, setLeaveFlowStep] = useState('chooseLocation');
   const [verifiedSpot, setVerifiedSpot] = useState(null);
+  const [clientId, setClientId] = useState(null);
+  const convexClient = useConvex();
 
   const activeSpots = useQuery(
     api.parking.getNearbyActiveSpots,
@@ -514,6 +562,63 @@ function ParkingApp() {
   }, []);
 
   useEffect(() => {
+    let isMounted = true;
+
+    getClientId()
+      .then((id) => {
+        if (isMounted) {
+          setClientId(id);
+        }
+      })
+      .catch((error) => {
+        console.error(error);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Restore the user's own active share after an app restart so "Give parking"
+  // reopens on the live spot instead of losing it. Single indexed read.
+  useEffect(() => {
+    if (!clientId) {
+      return undefined;
+    }
+
+    let isActive = true;
+
+    convexClient
+      .query(api.parking.getMyActiveSpot, { client_id: clientId })
+      .then((spot) => {
+        if (!isActive || !spot) {
+          return;
+        }
+
+        setSharedSpot((currentSpot) =>
+          currentSpot || {
+            id: spot._id,
+            coordinate: {
+              latitude: spot.latitude,
+              longitude: spot.longitude,
+            },
+            scheduledDepartureTime: spot.scheduled_departure_time,
+            departureWindowLabel: spot.departure_window_label,
+            expiresAt: spot.expires_at,
+            openConfirmedAt: spot.open_confirmed_at,
+          },
+        );
+      })
+      .catch((error) => {
+        console.error(error);
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [clientId, convexClient]);
+
+  useEffect(() => {
     if (sharedSpot && now >= sharedSpot.expiresAt) {
       setSharedSpot(null);
     }
@@ -618,6 +723,61 @@ function ParkingApp() {
       }
     };
   }, [intent, navigationSpot, screen]);
+
+  // Keep the user's position live while the map is open (outside turn-by-turn
+  // navigation, which runs its own high-accuracy watcher). This keeps the blue
+  // dot, recenter, distances and "share my location" accurate as they move,
+  // without hijacking the map — panning to browse other areas still works.
+  useEffect(() => {
+    if (screen !== 'map' || navigationSpot) {
+      return undefined;
+    }
+
+    let isActive = true;
+    let subscription = null;
+
+    const startLocationWatcher = async () => {
+      try {
+        const { status } = await Location.getForegroundPermissionsAsync();
+
+        if (status !== 'granted') {
+          return;
+        }
+
+        const nextSubscription = await Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.Balanced,
+            distanceInterval: LOCATION_WATCH_DISTANCE_METERS,
+            timeInterval: LOCATION_WATCH_INTERVAL_MS,
+          },
+          (nextLocation) => {
+            if (isActive) {
+              setLocation(nextLocation.coords);
+            }
+          },
+        );
+
+        if (!isActive) {
+          nextSubscription.remove();
+          return;
+        }
+
+        subscription = nextSubscription;
+      } catch (error) {
+        console.warn(error);
+      }
+    };
+
+    startLocationWatcher();
+
+    return () => {
+      isActive = false;
+
+      if (subscription) {
+        subscription.remove();
+      }
+    };
+  }, [screen, navigationSpot]);
 
   if (showIntro) {
     return (
@@ -1126,18 +1286,20 @@ function ParkingApp() {
               <Text style={styles.panelTitle}>{sharedSpotDisplay.title}</Text>
               <Text style={styles.panelCopy}>{sharedSpotDisplay.copy}</Text>
             </View>
-            <Pressable
-              style={styles.cancelButton}
-              onPress={handleCancelSharedSpot}
-              disabled={isCancellingSpot}
-            >
-              {isCancellingSpot ? (
-                <ActivityIndicator size="small" color={colors.white} />
-              ) : (
-                <Ionicons name="close" size={18} color={colors.white} />
-              )}
-            </Pressable>
           </View>
+
+          <Pressable
+            style={[styles.dangerButton, isCancellingSpot && styles.buttonDisabled]}
+            onPress={handleCancelSharedSpot}
+            disabled={isCancellingSpot}
+          >
+            {isCancellingSpot ? (
+              <ActivityIndicator size="small" color={colors.red} />
+            ) : (
+              <Ionicons name="close-circle" size={20} color={colors.red} />
+            )}
+            <Text style={styles.dangerButtonText}>Cancel this parking</Text>
+          </Pressable>
         </View>
       );
     }
@@ -1372,7 +1534,9 @@ function ParkingApp() {
           <ActivityIndicator size="large" color={colors.green} />
         </View>
         <Text style={styles.centerTitle}>Finding you</Text>
-        <Text style={styles.centerCopy}>One second. We are opening the map.</Text>
+        <Text style={styles.centerCopy}>
+          Opening the live map and scanning for fresh parking near you.
+        </Text>
       </View>
     );
   }
@@ -1393,11 +1557,20 @@ function ParkingApp() {
           <Ionicons name="location" size={28} color={colors.orange} />
         </View>
         <Text style={styles.centerTitle}>Location is off</Text>
-        <Text style={styles.centerCopy}>{errorMsg}</Text>
-        <Pressable style={styles.primaryButton} onPress={() => prepareMap(intent)}>
+        <Text style={styles.centerCopy}>
+          {errorMsg || 'Park2Me needs your location to show spots opening around you.'}
+        </Text>
+        <Pressable
+          style={[styles.primaryButton, styles.centerActionButton]}
+          onPress={() => prepareMap(intent)}
+        >
+          <Ionicons name="refresh" size={19} color={colors.black} />
           <Text style={styles.primaryButtonText}>Try again</Text>
         </Pressable>
-        <Pressable style={styles.softButton} onPress={() => Linking.openSettings()}>
+        <Pressable
+          style={[styles.softButton, styles.centerActionButton]}
+          onPress={() => Linking.openSettings()}
+        >
           <Text style={styles.softButtonText}>Open settings</Text>
         </Pressable>
       </View>
@@ -1685,22 +1858,125 @@ function ParkingApp() {
                 </>
               ) : (
                 <>
-                  <Text style={styles.panelTitle}>
-                    {focusedSignal ? focusedSignal.title : 'No fresh spots yet'}
-                  </Text>
-                  <Text style={styles.panelCopy}>
-                    {focusedSignal
-                      ? `${focusedSignal.subtitle}. Tap another spot to change.`
-                      : 'Leave the map open. New spots appear automatically.'}
-                  </Text>
-                  <Pressable
-                    style={[styles.primaryButton, !focusedSignal && styles.buttonDisabled]}
-                    onPress={() => handleStartInAppNavigation(focusedSignal)}
-                    disabled={!focusedSignal}
-                  >
-                    <Ionicons name="navigate" size={20} color={colors.black} />
-                    <Text style={styles.primaryButtonText}>Start GPS</Text>
-                  </Pressable>
+                  <View style={styles.listHeaderRow}>
+                    <View style={styles.listHeaderText}>
+                      <Text style={styles.panelTitle}>Fresh spots</Text>
+                      <Text style={styles.panelCopy}>
+                        {activeSpots === undefined
+                          ? 'Scanning the streets around you…'
+                          : parkingSignals.length
+                            ? 'Tap a spot, then start in-app GPS.'
+                            : 'Keep the map open — new spots appear live.'}
+                      </Text>
+                    </View>
+                    {parkingSignals.length > 0 && (
+                      <View style={styles.listCountPill}>
+                        <Ionicons name="flash" size={13} color={colors.green} />
+                        <Text style={styles.listCountText}>{parkingSignals.length}</Text>
+                      </View>
+                    )}
+                  </View>
+
+                  {activeSpots === undefined ? (
+                    <View style={{ gap: 10 }}>
+                      <View style={styles.skeletonRow} />
+                      <View style={styles.skeletonRow} />
+                    </View>
+                  ) : parkingSignals.length === 0 ? (
+                    <View style={styles.emptyState}>
+                      <View style={styles.emptyIcon}>
+                        <Ionicons name="car-sport" size={30} color={colors.green} />
+                      </View>
+                      <Text style={styles.emptyTitle}>No fresh spots yet</Text>
+                      <Text style={styles.emptyCopy}>
+                        Leave Park2Me open. The moment a nearby driver shares a spot it appears
+                        here instantly — no refresh needed.
+                      </Text>
+                      <Pressable style={styles.softHalfButton} onPress={() => prepareMap('find')}>
+                        <Ionicons name="locate" size={18} color={colors.white} />
+                        <Text style={styles.softHalfButtonText}>Recenter</Text>
+                      </Pressable>
+                    </View>
+                  ) : (
+                    <>
+                      <ScrollView
+                        style={styles.spotList}
+                        contentContainerStyle={styles.spotListContent}
+                        showsVerticalScrollIndicator={false}
+                      >
+                        {parkingSignals.map((signal) => {
+                          const isSelected = focusedSignal?.id === signal.id;
+                          const verified = signal.isVerifiedOpen;
+
+                          return (
+                            <Pressable
+                              key={signal.id}
+                              style={[styles.spotRow, isSelected && styles.spotRowSelected]}
+                              onPress={() => setSelectedSignalId(signal.id)}
+                            >
+                              <View
+                                style={[
+                                  styles.spotRowIcon,
+                                  { backgroundColor: verified ? colors.greenSoft : colors.orangeSoft },
+                                ]}
+                              >
+                                <Ionicons
+                                  name={verified ? 'checkmark-circle' : 'time'}
+                                  size={22}
+                                  color={verified ? colors.green : colors.orange}
+                                />
+                              </View>
+                              <View style={styles.spotRowBody}>
+                                <View
+                                  style={[
+                                    styles.trustBadge,
+                                    verified ? styles.trustBadgeVerified : styles.trustBadgeSoon,
+                                  ]}
+                                >
+                                  <View
+                                    style={{
+                                      width: 6,
+                                      height: 6,
+                                      borderRadius: 3,
+                                      backgroundColor: verified ? colors.green : colors.orange,
+                                    }}
+                                  />
+                                  <Text
+                                    style={[
+                                      styles.trustBadgeText,
+                                      verified
+                                        ? styles.trustBadgeTextVerified
+                                        : styles.trustBadgeTextSoon,
+                                    ]}
+                                  >
+                                    {verified ? 'Verified open' : 'Opening soon'}
+                                  </Text>
+                                </View>
+                                <Text style={styles.spotRowMeta} numberOfLines={1}>
+                                  {signal.freshnessLabel}
+                                </Text>
+                              </View>
+                              <View style={styles.spotRowRight}>
+                                <Text style={styles.spotRowDistance}>{signal.distanceLabel}</Text>
+                                <Text style={styles.spotRowEta}>{signal.etaLabel}</Text>
+                              </View>
+                            </Pressable>
+                          );
+                        })}
+                      </ScrollView>
+
+                      <Pressable
+                        style={[styles.primaryButton, !focusedSignal && styles.buttonDisabled]}
+                        onPress={() => handleStartInAppNavigation(focusedSignal)}
+                        disabled={!focusedSignal}
+                      >
+                        <Ionicons name="navigate" size={20} color={colors.black} />
+                        <Text style={styles.primaryButtonText}>
+                          {focusedSignal ? `Start GPS · ${focusedSignal.distanceLabel}` : 'Select a spot'}
+                        </Text>
+                      </Pressable>
+                    </>
+                  )}
                 </>
               )}
             </View>
@@ -1741,28 +2017,55 @@ function ParkingApp() {
 
       <View style={styles.heroCard}>
         <View style={styles.heroGlow} />
+        <View style={styles.heroGlowSecondary} />
+        <View style={styles.heroBadge}>
+          <Ionicons name="flash" size={13} color={colors.green} />
+          <Text style={styles.heroBadgeText}>Live nearby parking</Text>
+        </View>
         <Text style={styles.heroTitle}>Park easier.</Text>
-        <Text style={styles.heroCopy}>Find a spot or give yours when you leave.</Text>
+        <Text style={styles.heroCopy}>
+          Grab a spot the second another driver pulls out — or pass yours forward when you go.
+        </Text>
       </View>
+
+      {sharedSpotDisplay && (
+        <Pressable style={styles.resumeCard} onPress={() => prepareMap('leave')}>
+          <View
+            style={[
+              styles.resumeDot,
+              { backgroundColor: signalTypes[sharedSpotDisplay.status].color },
+            ]}
+          />
+          <View style={styles.resumeText}>
+            <Text style={styles.resumeTitle}>{sharedSpotDisplay.title}</Text>
+            <Text style={styles.resumeCopy} numberOfLines={1}>
+              Your shared spot is still live. Tap to manage it.
+            </Text>
+          </View>
+          <Ionicons name="arrow-forward" size={20} color={colors.green} />
+        </Pressable>
+      )}
 
       <View style={styles.menuActions}>
         <MenuAction
           icon="search"
           title="Find a spot"
-          copy="Open the map."
+          copy="See fresh spots opening near you."
           onPress={() => prepareMap('find')}
         />
         <MenuAction
           icon="car"
           title="Give parking"
-          copy="Help another driver."
+          copy="Share your spot as you leave."
           onPress={() => prepareMap('leave')}
         />
       </View>
 
       <View style={styles.simplePromise}>
         <Ionicons name="leaf" size={20} color={colors.green} />
-        <Text style={styles.simplePromiseText}>Fresh spots only. No clutter.</Text>
+        <Text style={styles.simplePromiseText}>
+          Fresh, verified spots only. Anonymous by design — no plates, no clutter.
+        </Text>
       </View>
     </ScrollView>
   );
@@ -1856,26 +2159,55 @@ const styles = StyleSheet.create({
     height: 58,
   },
   heroCard: {
-    minHeight: 270,
+    minHeight: 276,
     justifyContent: 'flex-end',
     gap: 12,
     overflow: 'hidden',
-    padding: 22,
-    borderRadius: 30,
+    padding: 24,
+    borderRadius: 32,
     backgroundColor: colors.panel,
     borderWidth: 1,
-    borderColor: colors.border,
-    boxShadow: '0 22px 44px rgba(0, 0, 0, 0.35)',
+    borderColor: colors.borderStrong,
+    boxShadow: '0 26px 60px rgba(0, 0, 0, 0.5)',
   },
   heroGlow: {
     position: 'absolute',
-    top: 28,
-    right: -36,
-    width: 220,
-    height: 220,
-    borderRadius: 110,
+    top: 24,
+    right: -46,
+    width: 240,
+    height: 240,
+    borderRadius: 120,
     backgroundColor: colors.green,
-    opacity: 0.22,
+    opacity: 0.26,
+  },
+  heroGlowSecondary: {
+    position: 'absolute',
+    bottom: -70,
+    left: -50,
+    width: 200,
+    height: 200,
+    borderRadius: 100,
+    backgroundColor: colors.greenDeep,
+    opacity: 0.16,
+  },
+  heroBadge: {
+    flexDirection: 'row',
+    alignSelf: 'flex-start',
+    alignItems: 'center',
+    gap: 7,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 999,
+    backgroundColor: colors.greenSoft,
+    borderWidth: 1,
+    borderColor: colors.green,
+  },
+  heroBadgeText: {
+    color: colors.green,
+    fontSize: 12,
+    fontWeight: '900',
+    letterSpacing: 0.3,
+    textTransform: 'uppercase',
   },
   heroTitle: {
     color: colors.white,
@@ -1926,6 +2258,35 @@ const styles = StyleSheet.create({
   menuActionCopy: {
     color: colors.muted,
     fontSize: 14,
+    fontWeight: '700',
+  },
+  resumeCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 13,
+    padding: 16,
+    borderRadius: 22,
+    backgroundColor: colors.panelSoft,
+    borderWidth: 1,
+    borderColor: colors.borderStrong,
+  },
+  resumeDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+  },
+  resumeText: {
+    flex: 1,
+    gap: 2,
+  },
+  resumeTitle: {
+    color: colors.white,
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  resumeCopy: {
+    color: colors.muted,
+    fontSize: 13,
     fontWeight: '700',
   },
   simplePromise: {
@@ -2061,16 +2422,16 @@ const styles = StyleSheet.create({
     gap: 14,
     paddingTop: 10,
     paddingHorizontal: 16,
-    borderTopLeftRadius: 32,
-    borderTopRightRadius: 32,
-    backgroundColor: colors.black,
+    borderTopLeftRadius: 34,
+    borderTopRightRadius: 34,
+    backgroundColor: colors.panel,
     borderWidth: 1,
-    borderColor: colors.border,
-    boxShadow: '0 -22px 42px rgba(0, 0, 0, 0.42)',
+    borderColor: colors.borderStrong,
+    boxShadow: '0 -24px 60px rgba(0, 0, 0, 0.55)',
   },
   panelHandle: {
     alignSelf: 'center',
-    width: 42,
+    width: 44,
     height: 5,
     borderRadius: 3,
     backgroundColor: colors.panelRaised,
@@ -2319,14 +2680,6 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     fontWeight: '700',
   },
-  cancelButton: {
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 16,
-    backgroundColor: colors.panelRaised,
-  },
   timeRow: {
     flexDirection: 'row',
     gap: 9,
@@ -2387,10 +2740,186 @@ const styles = StyleSheet.create({
   buttonDisabled: {
     opacity: 0.72,
   },
+  dangerButton: {
+    minHeight: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 9,
+    paddingHorizontal: 18,
+    borderRadius: 20,
+    backgroundColor: colors.redSoft,
+    borderWidth: 1,
+    borderColor: colors.red,
+  },
+  dangerButtonText: {
+    color: colors.red,
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  centerActionButton: {
+    alignSelf: 'stretch',
+    maxWidth: 340,
+    width: '100%',
+  },
   tinyNote: {
     color: colors.dim,
     fontSize: 13,
     fontWeight: '800',
     textAlign: 'center',
+  },
+
+  // Find mode: browsable ranked spot list
+  listHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  listHeaderText: {
+    flex: 1,
+    gap: 2,
+  },
+  listCountPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: colors.greenSoft,
+    borderWidth: 1,
+    borderColor: colors.green,
+  },
+  listCountText: {
+    color: colors.green,
+    fontSize: 13,
+    fontWeight: '900',
+    fontVariant: ['tabular-nums'],
+  },
+  spotList: {
+    maxHeight: 232,
+    marginHorizontal: -4,
+  },
+  spotListContent: {
+    gap: 10,
+    paddingHorizontal: 4,
+    paddingBottom: 2,
+  },
+  spotRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 13,
+    padding: 13,
+    borderRadius: 20,
+    backgroundColor: colors.panelSoft,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  spotRowSelected: {
+    borderColor: colors.green,
+    backgroundColor: colors.greenSoft,
+  },
+  spotRowIcon: {
+    width: 46,
+    height: 46,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 16,
+  },
+  spotRowBody: {
+    flex: 1,
+    gap: 5,
+  },
+  spotRowMeta: {
+    color: colors.muted,
+    fontSize: 13,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
+  },
+  spotRowRight: {
+    alignItems: 'flex-end',
+    gap: 4,
+  },
+  spotRowDistance: {
+    color: colors.white,
+    fontSize: 16,
+    fontWeight: '900',
+    fontVariant: ['tabular-nums'],
+  },
+  spotRowEta: {
+    color: colors.dim,
+    fontSize: 12,
+    fontWeight: '800',
+    fontVariant: ['tabular-nums'],
+  },
+  trustBadge: {
+    flexDirection: 'row',
+    alignSelf: 'flex-start',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  trustBadgeVerified: {
+    backgroundColor: colors.greenSoft,
+    borderColor: colors.green,
+  },
+  trustBadgeSoon: {
+    backgroundColor: colors.orangeSoft,
+    borderColor: colors.orange,
+  },
+  trustBadgeText: {
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 0.2,
+    textTransform: 'uppercase',
+  },
+  trustBadgeTextVerified: {
+    color: colors.green,
+  },
+  trustBadgeTextSoon: {
+    color: colors.orange,
+  },
+
+  // Empty / loading states inside the find panel
+  emptyState: {
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 22,
+    paddingHorizontal: 12,
+  },
+  emptyIcon: {
+    width: 72,
+    height: 72,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 26,
+    backgroundColor: colors.panelSoft,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  emptyTitle: {
+    color: colors.white,
+    fontSize: 20,
+    fontWeight: '900',
+    textAlign: 'center',
+  },
+  emptyCopy: {
+    maxWidth: 290,
+    color: colors.muted,
+    fontSize: 14,
+    lineHeight: 20,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  skeletonRow: {
+    height: 72,
+    borderRadius: 20,
+    backgroundColor: colors.panelSoft,
+    borderWidth: 1,
+    borderColor: colors.hairline,
   },
 });
