@@ -79,6 +79,7 @@ const arrivalFeedbackMessages = {
 };
 const CLIENT_ID_STORAGE_KEY = 'park2me.clientId';
 const DRAFT_SPOT_STORAGE_KEY = 'park2me.draftSpot';
+const DISCLAIMER_STORAGE_KEY = 'park2me.safetyDisclaimerAccepted.v1';
 const ACTIVE_QUERY_LIMIT = 60;
 const MAP_QUERY_CELL_SIZE_DEGREES = 0.01;
 const DRAFT_SPOT_MAX_AGE_MS = 2 * 60 * 60 * 1000;
@@ -444,6 +445,9 @@ function ParkingApp() {
   const [leaveFlowStep, setLeaveFlowStep] = useState('chooseLocation');
   const [verifiedSpot, setVerifiedSpot] = useState(null);
   const [clientId, setClientId] = useState(null);
+  const [disclaimerReady, setDisclaimerReady] = useState(false);
+  const [disclaimerAccepted, setDisclaimerAccepted] = useState(false);
+  const [isAcceptingDisclaimer, setIsAcceptingDisclaimer] = useState(false);
   const convexClient = useConvex();
 
   const activeSpots = useQuery(
@@ -578,6 +582,44 @@ function ParkingApp() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    AsyncStorage.getItem(DISCLAIMER_STORAGE_KEY)
+      .then((value) => {
+        if (isMounted) {
+          setDisclaimerAccepted(value === 'true');
+          setDisclaimerReady(true);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setDisclaimerReady(true);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const handleAcceptDisclaimer = async () => {
+    if (isAcceptingDisclaimer) {
+      return;
+    }
+
+    setIsAcceptingDisclaimer(true);
+    setDisclaimerAccepted(true);
+
+    try {
+      await AsyncStorage.setItem(DISCLAIMER_STORAGE_KEY, 'true');
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setIsAcceptingDisclaimer(false);
+    }
+  };
 
   // Restore the user's own active share after an app restart so "Give parking"
   // reopens on the live spot instead of losing it. Single indexed read.
@@ -779,11 +821,77 @@ function ParkingApp() {
     };
   }, [screen, navigationSpot]);
 
-  if (showIntro) {
+  if (showIntro || !disclaimerReady) {
     return (
       <View style={styles.introScreen}>
         <StatusBar style="light" />
         <Image source={park2MeLogo} style={styles.introLogo} resizeMode="contain" />
+      </View>
+    );
+  }
+
+  if (!disclaimerAccepted) {
+    return (
+      <View
+        style={[
+          styles.disclaimerScreen,
+          { paddingTop: insets.top + 26, paddingBottom: insets.bottom + 22 },
+        ]}
+      >
+        <StatusBar style="light" />
+        <ScrollView
+          contentContainerStyle={styles.disclaimerContent}
+          showsVerticalScrollIndicator={false}
+        >
+          <View style={styles.disclaimerIcon}>
+            <Ionicons name="shield-checkmark" size={28} color={colors.green} />
+          </View>
+          <Text style={styles.disclaimerTitle}>Before you start</Text>
+          <Text style={styles.disclaimerLead}>
+            Park2Me helps drivers share and find parking. Please read this quickly.
+          </Text>
+
+          <View style={styles.disclaimerList}>
+            <DisclaimerPoint
+              icon="car-sport"
+              title="Never use while driving"
+              copy="Set your destination before you drive, and follow all traffic laws. Don't tap, type, or read the map while the car is moving."
+            />
+            <DisclaimerPoint
+              icon="time"
+              title="Spots aren't guaranteed"
+              copy="Shared spots are live estimates from other drivers. A space may be taken or unavailable by the time you arrive."
+            />
+            <DisclaimerPoint
+              icon="lock-closed"
+              title="Anonymous by design"
+              copy="No account, name, or license plate. Your location is used only to show nearby spots and is not linked to your identity."
+            />
+            <DisclaimerPoint
+              icon="hand-left"
+              title="Park responsibly"
+              copy="Only park where it's legal and safe. Park2Me is not responsible for fines, tows, or disputes over parking spaces."
+            />
+          </View>
+
+          <Text style={styles.disclaimerFinePrint}>
+            By continuing you agree to use Park2Me safely and lawfully, and accept our Terms and
+            Privacy Policy.
+          </Text>
+        </ScrollView>
+
+        <Pressable
+          style={[styles.primaryButton, isAcceptingDisclaimer && styles.buttonDisabled]}
+          onPress={handleAcceptDisclaimer}
+          disabled={isAcceptingDisclaimer}
+        >
+          {isAcceptingDisclaimer ? (
+            <ActivityIndicator size="small" color={colors.black} />
+          ) : (
+            <Ionicons name="checkmark-circle" size={20} color={colors.black} />
+          )}
+          <Text style={styles.primaryButtonText}>I understand — continue</Text>
+        </Pressable>
       </View>
     );
   }
@@ -2071,6 +2179,20 @@ function ParkingApp() {
   );
 }
 
+function DisclaimerPoint({ copy, icon, title }) {
+  return (
+    <View style={styles.disclaimerPoint}>
+      <View style={styles.disclaimerPointIcon}>
+        <Ionicons name={icon} size={19} color={colors.green} />
+      </View>
+      <View style={styles.disclaimerPointText}>
+        <Text style={styles.disclaimerPointTitle}>{title}</Text>
+        <Text style={styles.disclaimerPointCopy}>{copy}</Text>
+      </View>
+    </View>
+  );
+}
+
 function MenuAction({ copy, icon, onPress, title }) {
   return (
     <Pressable style={styles.menuAction} onPress={onPress}>
@@ -2140,6 +2262,83 @@ const styles = StyleSheet.create({
     fontSize: 16,
     lineHeight: 23,
     textAlign: 'center',
+  },
+  disclaimerScreen: {
+    flex: 1,
+    gap: 16,
+    paddingHorizontal: 22,
+    backgroundColor: colors.black,
+  },
+  disclaimerContent: {
+    gap: 14,
+    paddingBottom: 10,
+  },
+  disclaimerIcon: {
+    width: 64,
+    height: 64,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 22,
+    backgroundColor: colors.panelSoft,
+    borderWidth: 1,
+    borderColor: colors.borderStrong,
+  },
+  disclaimerTitle: {
+    color: colors.white,
+    fontSize: 30,
+    fontWeight: '900',
+    letterSpacing: 0,
+  },
+  disclaimerLead: {
+    color: colors.muted,
+    fontSize: 16,
+    lineHeight: 23,
+    fontWeight: '700',
+  },
+  disclaimerList: {
+    gap: 12,
+    marginTop: 4,
+  },
+  disclaimerPoint: {
+    flexDirection: 'row',
+    gap: 13,
+    padding: 15,
+    borderRadius: 20,
+    backgroundColor: colors.panelSoft,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  disclaimerPointIcon: {
+    width: 42,
+    height: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 15,
+    backgroundColor: colors.greenSoft,
+    borderWidth: 1,
+    borderColor: colors.green,
+  },
+  disclaimerPointText: {
+    flex: 1,
+    gap: 3,
+  },
+  disclaimerPointTitle: {
+    color: colors.white,
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  disclaimerPointCopy: {
+    color: colors.muted,
+    fontSize: 14,
+    lineHeight: 20,
+    fontWeight: '700',
+  },
+  disclaimerFinePrint: {
+    marginTop: 6,
+    color: colors.dim,
+    fontSize: 13,
+    lineHeight: 19,
+    fontWeight: '700',
   },
   menuScreen: {
     flex: 1,
